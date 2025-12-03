@@ -1,0 +1,19 @@
+================================================================================
+RESUMEN DE BÚSQUEDA DE HIPERPARÁMETROS
+================================================================================
+
+MEJOR CONFIGURACIÓN (Micro F1):
+  Classifier: PretrainedRollingMultiLabel
+  Window Size: 100
+  Epochs: 10
+  Micro F1: 0.542763
+  Macro F1: 0.350572
+  Accuracy: 0.994440
+
+TOP 5 CONFIGURACIONES:
+            classifier_type  window_size  epochs  total_samples  accuracy  micro_f1  macro_f1  subset_accuracy  hamming_loss  example_f1  micro_precision  micro_recall  macro_precision  macro_recall  elapsed_time_seconds
+PretrainedRollingMultiLabel          100      10          10000   0.99444  0.542763  0.350572           0.9734       0.00556    0.015533         0.702128      0.442359         0.510260      0.315118                240.48
+PretrainedRollingMultiLabel           50      10          10000   0.99420  0.521452  0.327783           0.9728       0.00580    0.015183         0.678112      0.423592         0.394464      0.297556                239.14
+PretrainedRollingMultiLabel           50       3          10000   0.99378  0.484245  0.304627           0.9706       0.00622    0.014067         0.634783      0.391421         0.372841      0.275652                 81.33
+PretrainedRollingMultiLabel           50      50          10000   0.99316  0.465625  0.305934           0.9675       0.00684    0.013833         0.558052      0.399464         0.343119      0.281839               1123.01
+PretrainedRollingMultiLabel          100      50          10000   0.99296  0.435897  0.282694           0.9674       0.00704    0.013000         0.541833      0.364611         0.325111      0.254813               1127.15
