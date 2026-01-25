@@ -386,10 +386,11 @@ def progressive_val_score(
 def apply_transformer_to_window(transformer, df, learn=False):
     """
     Applies a transformer to a DataFrame window.
-    
-    If learn=True, it updates the transformer on the LAST row (the new instance),
-    THEN transforms ALL rows using the updated state.
-    
+
+    IMPORTANT: To prevent data leakage when learn=True:
+    - Transforms each row BEFORE updating the transformer with that row
+    - Then learns from that row for use in FUTURE transformations
+
     Parameters
     ----------
     transformer : river.base.Transformer
@@ -397,89 +398,81 @@ def apply_transformer_to_window(transformer, df, learn=False):
     df : pd.DataFrame
         The input DataFrame window.
     learn : bool
-        Whether to update the transformer.
-        
+        Whether to update the transformer AFTER transforming.
+
     Returns
     -------
     pd.DataFrame
         The transformed DataFrame.
     """
-    n_rows = len(df)
-    
-    # 1. Learn Phase (if enabled)
-    if learn:
-        # Update on ALL rows to replicate reproduce_issue.py behavior (Fast Adaptation / Local Normalization)
-        # This gives more weight to the current window, effectively centering the scaler on the recent history.
-        for _, row in df.iterrows():
-            transformer.learn_one(row.to_dict())
-        
-    # 2. Transform Phase
-    # Transform all rows using the (possibly updated) state
     transformed_rows = []
+
     for _, row in df.iterrows():
         row_dict = row.to_dict()
+
+        # 1. Transform FIRST - Use current transformer state (no leakage)
         trans_row = transformer.transform_one(row_dict)
         transformed_rows.append(trans_row)
-        
+
+        # 2. Learn AFTER - Update transformer for NEXT instance
+        if learn:
+            transformer.learn_one(row_dict)
+
     return pd.DataFrame(transformed_rows)
 
 
 def progressive_val_score_sequence(dataset, model, metric, print_every=100, show_memory=False):
     """
-    Progressive validation score for sequence data (DataFrames) using a River Pipeline.
+    Progressive validation score for sequence data (DataFrames).
     
-    Handles the mismatch between RollingAi4i (yielding DataFrames) and 
-    standard River Transformers (expecting dicts).
-    
+    This is the DataFrame equivalent of progressive_val_score.
+    It works exactly the same way but handles DataFrames instead of dicts.
+
     Parameters
     ----------
     dataset : iterable
-        Yields (x_df, y).
+        Yields (x_df, y) where x_df is a DataFrame and y is the target.
     model : river.compose.Pipeline
         The pipeline to evaluate.
     metric : river.metrics.Metric
         The metric to update.
+    print_every : int
+        Print metric every N samples.
+    show_memory : bool
+        Whether to show memory usage.
     """
-    
     # Check if model is a Pipeline
     if not isinstance(model, compose.Pipeline):
         raise ValueError("Model must be a river.compose.Pipeline")
-        
+
     # Separate transformers and final estimator
     steps = list(model.steps.values()) if isinstance(model.steps, dict) else list(model.steps)
     transformers = steps[:-1]
     classifier = steps[-1]
-    
-    start_time = time.time()
+
     n_samples = 0
-    
-    for i, (x_df, y) in enumerate(dataset):
-        # 1. PREDICT PHASE
-        # Apply transformers (transform only)
-        x_trans = x_df
+
+    for x_df, y in dataset:
+        # CRITICAL: Apply transformers ONCE with learn=True
+        # This matches the working manual loop behavior
+        # The same transformed DataFrame is used for both predict and learn
+        x_trans = x_df.copy()
         for transformer in transformers:
-            x_trans = apply_transformer_to_window(transformer, x_trans, learn=False)
-            
+            x_trans = apply_transformer_to_window(transformer, x_trans, learn=True)
+        
+        # 1. PREDICT using the transformed DataFrame
         y_pred = classifier.predict_one(x_trans)
         
-        # Debug: Check if we have any positive predictions and what the ground truth is
-        # if any(y_pred.values()):
-        #     print(f"DEBUG: Step {i+1} | Pred: {y_pred} | True: {y}")
-
-        # 2. METRIC UPDATE
+        # 2. UPDATE METRIC
         metric.update(y, y_pred)
         
-        # 3. LEARN PHASE
-        # Apply transformers (learn only on last row)
-        x_trans_learn = x_df
-        for transformer in transformers:
-            x_trans_learn = apply_transformer_to_window(transformer, x_trans_learn, learn=True)
-            
-        classifier.learn_one(x_trans_learn, y)
+        # 3. LEARN using the SAME transformed DataFrame
+        classifier.learn_one(x_trans, y)
         
         n_samples += 1
         
-        if (i + 1) % print_every == 0:
-            print(f"[{i + 1}] {metric}")
-            
+        # Print progress
+        if print_every > 0 and n_samples % print_every == 0:
+            print(f"[{n_samples}] {metric}")
+    
     return metric

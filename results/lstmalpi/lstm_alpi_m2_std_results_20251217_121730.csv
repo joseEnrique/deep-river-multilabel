@@ -1,0 +1,7 @@
+Model,Status,Macro F1,Micro F1
+LSTM-Small-LR1e3-W1,Error: name 'RollingMultiLabelClassifier' is not defined,0.0,0.0
+LSTM-Small-LR5e4-W1,Error: name 'RollingMultiLabelClassifier' is not defined,0.0,0.0
+LSTM-Medium-LR1e3-W1,Error: name 'RollingMultiLabelClassifier' is not defined,0.0,0.0
+LSTM-Medium-LR5e4-W1,Error: name 'RollingMultiLabelClassifier' is not defined,0.0,0.0
+LSTM-Large-LR1e3-W1,Error: name 'RollingMultiLabelClassifier' is not defined,0.0,0.0
+LSTM-Large-LR5e4-W1,Error: name 'RollingMultiLabelClassifier' is not defined,0.0,0.0

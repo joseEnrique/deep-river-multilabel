@@ -1,0 +1,2 @@
+Name,Loss,Exact Match,Macro F1,Micro F1,Time
+BestConfig-WFL_Ensemble_Memory_LowThresh,WFL_Ensemble_Memory_LowThresh,7.8306481828400445,42.61163128510065,62.3366449453406,854.8053543567657

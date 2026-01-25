@@ -1,0 +1,1 @@
+Siempre usa el entorno virtual (.venv) para ejecutar comandos de python o instalar dependencias. Para ejecutar un script, usa: source .venv/bin/activate && python <script.py> o simplemente .venv/bin/python <script.py>.

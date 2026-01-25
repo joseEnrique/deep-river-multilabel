@@ -8,6 +8,7 @@ from pathlib import Path
 
 
 pd.options.mode.chained_assignment = None
+pd.set_option('future.no_silent_downcasting', True)
 
 
 class Alpi(base.FileDataset):
@@ -145,7 +146,7 @@ class Alpi(base.FileDataset):
             Y.append({label: True for label in output})
         self.X = pd.DataFrame(X)
         self.Y = pd.DataFrame(Y)
-        self.Y.fillna(False, inplace=True)
+        self.Y = self.Y.fillna(False).astype(bool)
 
         result = pd.concat([self.X, self.Y], axis=1)
         destination = self.processed_dest()

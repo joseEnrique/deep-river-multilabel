@@ -183,9 +183,9 @@ def run_single_experiment(args):
         pipeline = (p_numeric + p_categorical) | forecaster
 
         # Create stream
-        # past_size=1: This is the key change requested
-        # include_targets=False: Critical fix to prevent data leakage (targets should NOT be in input)
-        stream = RollingAi4i(past_size=config['past_size'], n_instances=10000, include_targets=False)
+        # CRITICAL: include_targets=False to avoid data leakage
+        # The targets should NOT be in the feature DataFrame
+        stream = RollingAi4i(past_size=config['past_size'], n_instances=10000, include_targets=False, target_mode='classification')
 
         # Evaluate
         metrics_result = progressive_val_score_sequence(

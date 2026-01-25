@@ -100,6 +100,7 @@ class RollingMultiLabelClassifier(RollingDeepEstimator, river_base.MultiLabelCla
         epochs: int = 1,
         pos_weight: float | None = None,
         loss_fn: Callable | None = None,
+        gradient_scale: float = 1.0,
         **kwargs,
     ):
         # Store module class and params for deferred initialization
@@ -111,6 +112,7 @@ class RollingMultiLabelClassifier(RollingDeepEstimator, river_base.MultiLabelCla
         self.thresholds = thresholds or {t: 0.5 for t in label_names}
         self.epochs = max(1, int(epochs))
         self.pos_weight = pos_weight
+        self.gradient_scale = gradient_scale
         # Save the user-provided loss_fn before calling RollingDeepEstimator.__init__
         user_loss_fn = loss_fn
 
@@ -195,6 +197,10 @@ class RollingMultiLabelClassifier(RollingDeepEstimator, river_base.MultiLabelCla
 
         self.module.to(self.device)
 
+        # Move loss_fn to the same device if it's a torch module (necessary for custom buffers/parameters)
+        if isinstance(self.loss_fn, torch.nn.Module):
+            self.loss_fn.to(self.device)
+
         # Rebuild optimizer with the real module's parameters
         from deep_river.utils import get_optim_fn
         optimizer_func = get_optim_fn(self.optimizer_fn)
@@ -271,6 +277,13 @@ class RollingMultiLabelClassifier(RollingDeepEstimator, river_base.MultiLabelCla
                     loss = F.binary_cross_entropy_with_logits(logits, y_vec)
 
                 loss.backward()
+
+                # Apply gradient scaling if configured
+                if self.gradient_scale != 1.0:
+                    for p in self.module.parameters():
+                        if p.grad is not None:
+                            p.grad.data.mul_(self.gradient_scale)
+
                 self.optimizer.step()
 
     def predict_proba_one(self, x: Dict) -> Dict[str, float]:

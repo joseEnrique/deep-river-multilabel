@@ -1,0 +1,3 @@
+Model,Past Size,Window Size,Hidden Dim,Num Layers,LR,Dropout,Bidirectional,Epochs,ExactMatch,Macro F1,Micro F1,Status
+Medium-LR1e3-P1-W20,1,20,128,2,0.001,0.3,True,2,96.22962296229622,2.0202020202020203,2.3923444976076556,Success
+Medium-LR1e3-P10-W20,10,20,128,2,0.001,0.3,True,2,95.54554554554551,2.9788647900323024,3.292181069958848,Success

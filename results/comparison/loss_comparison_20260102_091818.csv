@@ -1,0 +1,2 @@
+Name,Loss,Exact Match,Macro F1,Micro F1,Time
+BestConfig-BalancedMemory_WFL,BalancedMemory_WFL,10.116148370176091,42.91319517883197,61.391102630298946,490.0735352039337
