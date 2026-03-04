@@ -45,9 +45,19 @@ def _progressive_validation(
 
     def report():
         if isinstance(metric, metrics.base.Metrics):
-            state = {m.__repr__().split(":")[0]: m.get() for m in metric}
+            state = {}
+            for m in metric:
+                try:
+                    key = m.__repr__().split(":")[0]
+                    state[key] = m.get()
+                except Exception:
+                    key = m.__class__.__name__
+                    state[key] = 0.0
         else:
-            state = {metric.__repr__().split(":")[0]: metric.get()}
+            try:
+                state = {metric.__repr__().split(":")[0]: metric.get()}
+            except Exception:
+                state = {metric.__class__.__name__: 0.0}
         state["Step"] = n_total_answers
         if active_learning:
             state["Samples used"] = n_samples_learned

@@ -712,6 +712,254 @@ class StaticWeightedFocalLoss(nn.Module):
             return loss.sum()
         else:
             return loss
+
+class AdaptiveWeightedFocalLoss(nn.Module):
+    """
+    Adaptive Weighted Focal Loss with "Focus Boost" Strategy (Recall-Based).
+    
+    Dynamically adjusts the positive class weight (beta) based on the 
+    Recall accuracy of each class.
+    
+    Strategy: Focus Boost
+    If a class has low Recall (lots of False Negatives), we boost its weight
+    to force the model to focus on it.
+    
+    beta_t = base_beta * (1 + (1 - Recall_t)^k)
+    
+    Where:
+    - base_beta: Initial balanced weight (e.g., 0.25)
+    - Recall_t: EMA of Recall for class t
+    - k: boosting power (e.g., 1 or 2)
+    
+    If Recall is 1.0 -> beta = base_beta
+    If Recall is 0.0 -> beta = base_beta * 2
+    """
+    def __init__(self, gamma=2.0, decay=0.99, base_beta=0.25, epsilon=1e-6, reduction='mean'):
+        super().__init__()
+        self.gamma = gamma
+        self.decay = decay
+        self.base_beta = base_beta
+        self.epsilon = epsilon
+        self.reduction = reduction
+        
+        # Register buffers for running stats (TP and FN for Recall)
+        self.register_buffer('running_tp', torch.ones(1)) 
+        self.register_buffer('running_fn', torch.ones(1))
+        self.num_classes = None
+
+    def _update_stats(self, logits, targets):
+        # logits: (batch, num_classes)
+        # targets: (batch, num_classes)
+        
+        if self.num_classes is None:
+            self.num_classes = targets.shape[1]
+            self.running_tp = torch.ones(self.num_classes, device=targets.device)
+            self.running_fn = torch.ones(self.num_classes, device=targets.device)
+            
+        if self.running_tp.device != targets.device:
+            self.running_tp = self.running_tp.to(targets.device)
+            self.running_fn = self.running_fn.to(targets.device)
+            
+        # Predictions (Threshold 0.5)
+        preds = (torch.sigmoid(logits) > 0.5).float()
+        
+        # Calculate Batch TP and FN
+        # TP: Pred=1, Target=1
+        batch_tp = (preds * targets).sum(dim=0)
+        # FN: Pred=0, Target=1
+        batch_fn = ((1 - preds) * targets).sum(dim=0)
+        
+        # Update EMAs
+        self.running_tp = self.decay * self.running_tp + (1 - self.decay) * batch_tp
+        self.running_fn = self.decay * self.running_fn + (1 - self.decay) * batch_fn
+
+    def get_logs(self):
+        with torch.no_grad():
+            recall = self.running_tp / (self.running_tp + self.running_fn + self.epsilon)
+            boost = 1.0 + (1.0 - recall)
+            beta = self.base_beta * boost
+            beta = torch.clamp(beta, max=0.9)
+            return {
+                "mean_alpha": beta.mean().item(),
+                "min_alpha": beta.min().item(),
+                "max_alpha": beta.max().item()
+            }
+
+    def forward(self, logits, targets):
+        if self.training:
+            with torch.no_grad():
+                self._update_stats(logits, targets)
+                
+        # Calculate Recall per class
+        # Recall = TP / (TP + FN)
+        recall = self.running_tp / (self.running_tp + self.running_fn + self.epsilon)
+        
+        # Calculate Boost
+        # If Recall is low, Boost is high (up to 2.0x)
+        boost = 1.0 + (1.0 - recall)
+        
+        # Dynamic Beta
+        beta = self.base_beta * boost
+        
+        # Clamp just in case, though 0.25 * 2 = 0.5 which is safe
+        beta = torch.clamp(beta, max=0.9)
+        
+        probs = torch.sigmoid(logits)
+        
+        # p_t: probability of the true class
+        p_t = probs * targets + (1 - probs) * (1 - targets)
+        
+        # beta_t: weight for the true class
+        # If target=1, beta_t = beta
+        # If target=0, beta_t = 1 - beta
+        beta_t = beta * targets + (1 - beta) * (1 - targets)
+        
+        # Focal Term: (1 - p_t)^gamma
+        focal_term = (1 - p_t) ** self.gamma
+        
+        # BCE Loss
+        bce_loss = F.binary_cross_entropy_with_logits(logits, targets, reduction='none')
+        
+        # WFL
+        loss = beta_t * focal_term * bce_loss
+        
+        if self.reduction == 'mean':
+            return loss.mean()
+        elif self.reduction == 'sum':
+            return loss.sum()
+        else:
+            return loss
+class FullAdaptiveFocalLoss(nn.Module):
+    """
+    Full Adaptive Focal Loss: Adapts both Alpha and Gamma.
+    
+    1. Alpha Adaptation (Focus Boost):
+       Increases weight for classes with Low Recall (Missed Positives).
+       alpha_t = base_alpha * (1 + (1 - Recall_t))
+       
+    2. Gamma Adaptation (Hardness Focus):
+       Increases focusing parameter for classes with Low Accuracy (Hard Classes).
+       gamma_t = base_gamma + (1 - Accuracy_t) * 2.0
+       
+       If a class is easy (Acc=1.0), gamma stays at base_gamma.
+       If a class is hard (Acc=0.0), gamma increases to (base + 2.0).
+    """
+    def __init__(self, base_gamma=2.0, decay=0.999, base_alpha=0.25, alpha_gain=1.0, gamma_gain=2.0, epsilon=1e-6, reduction='mean'):
+        super().__init__()
+        self.base_gamma = base_gamma
+        self.decay = decay
+        self.base_alpha = base_alpha
+        self.alpha_gain = alpha_gain
+        self.gamma_gain = gamma_gain
+        self.epsilon = epsilon
+        self.reduction = reduction
+        
+        # Stats for Recall (TP, FN) and Accuracy (TP+TN, Total)
+        self.register_buffer('running_tp', torch.ones(1)) 
+        self.register_buffer('running_fn', torch.ones(1))
+        self.register_buffer('running_correct', torch.ones(1))
+        self.register_buffer('running_count', torch.ones(1))
+        
+        self.num_classes = None
+
+    def _update_stats(self, logits, targets):
+        if self.num_classes is None:
+            self.num_classes = targets.shape[1]
+            self.running_tp = torch.ones(self.num_classes, device=targets.device)
+            self.running_fn = torch.ones(self.num_classes, device=targets.device)
+            self.running_correct = torch.ones(self.num_classes, device=targets.device)
+            self.running_count = torch.ones(self.num_classes, device=targets.device)
+            
+        if self.running_tp.device != targets.device:
+            self.running_tp = self.running_tp.to(targets.device)
+            self.running_fn = self.running_fn.to(targets.device)
+            self.running_correct = self.running_correct.to(targets.device)
+            self.running_count = self.running_count.to(targets.device)
+            
+        # Predictions
+        preds = (torch.sigmoid(logits) > 0.5).float()
+        
+        # Recall Stats
+        batch_tp = (preds * targets).sum(dim=0)
+        batch_fn = ((1 - preds) * targets).sum(dim=0)
+        
+        # Accuracy Stats
+        # Correct = (Pred == Target)
+        batch_correct = (preds == targets).float().sum(dim=0)
+        batch_count = targets.shape[0] # Broad cast later or just scalar addition if same for all? 
+        # Actually batch_count is scalar, but we track per class so adding scalar is fine.
+        
+        # Update EMAs
+        self.running_tp = self.decay * self.running_tp + (1 - self.decay) * batch_tp
+        self.running_fn = self.decay * self.running_fn + (1 - self.decay) * batch_fn
+        self.running_correct = self.decay * self.running_correct + (1 - self.decay) * batch_correct
+        self.running_count = self.decay * self.running_count + (1 - self.decay) * batch_count
+
+    def get_logs(self):
+        with torch.no_grad():
+            # Alpha
+            recall = self.running_tp / (self.running_tp + self.running_fn + self.epsilon)
+            alpha_boost = 1.0 + (1.0 - recall) * self.alpha_gain
+            alpha = self.base_alpha * alpha_boost
+            alpha = torch.clamp(alpha, max=0.9)
+            
+            # Gamma
+            accuracy = self.running_correct / (self.running_count + self.epsilon)
+            gamma_boost = (1.0 - accuracy) * self.gamma_gain
+            gamma = self.base_gamma + gamma_boost
+            
+            return {
+                "mean_alpha": alpha.mean().item(),
+                "mean_gamma": gamma.mean().item(),
+                "max_gamma": gamma.max().item()
+            }
+
+    def forward(self, logits, targets):
+        if self.training:
+            with torch.no_grad():
+                self._update_stats(logits, targets)
+        
+        # --- 1. Alpha Adaptation (Recall) ---
+        recall = self.running_tp / (self.running_tp + self.running_fn + self.epsilon)
+        alpha_boost = 1.0 + (1.0 - recall) * self.alpha_gain
+        alpha = self.base_alpha * alpha_boost
+        # Clamp alpha
+        alpha = torch.clamp(alpha, max=0.9)
+        
+        # --- 2. Gamma Adaptation (Accuracy) ---
+        accuracy = self.running_correct / (self.running_count + self.epsilon)
+        # Low Accuracy -> Increase Gamma
+        # Boost up to base + gamma_gain
+        gamma_boost = (1.0 - accuracy) * self.gamma_gain
+        gamma = self.base_gamma + gamma_boost
+        
+        # --- Loss Calculation ---
+        probs = torch.sigmoid(logits)
+        p_t = probs * targets + (1 - probs) * (1 - targets)
+        
+        # Alpha Term
+        # If target=1, alpha_t = alpha
+        # If target=0, alpha_t = 1 - alpha
+        alpha_t = alpha * targets + (1 - alpha) * (1 - targets)
+        
+        # Focal Term: (1 - p_t)^gamma
+        # Note: gamma is a tensor of shape (num_classes,)
+        # p_t is (batch, num_classes)
+        # We need to broadcast gamma
+        gamma_broadcast = gamma.unsqueeze(0) # (1, num_classes)
+        focal_term = (1 - p_t) ** gamma_broadcast
+        
+        bce_loss = F.binary_cross_entropy_with_logits(logits, targets, reduction='none')
+        
+        loss = alpha_t * focal_term * bce_loss
+        
+        if self.reduction == 'mean':
+            return loss.mean()
+        elif self.reduction == 'sum':
+            return loss.sum()
+        else:
+            return loss
+
 # ==========================
 # 10. AlpiEmbeddingCNN (1D CNN for Alarm Sequences)
 # ==========================
@@ -929,3 +1177,569 @@ class AlpiEmbeddingGRU(nn.Module):
         last_hidden = self.dropout(last_hidden)
         logits = self.fc(last_hidden)
         return logits
+
+# ==========================
+# 14. Bidirectional Adaptive Focal Loss
+# ==========================
+class BidirectionalAdaptiveFocalLoss(nn.Module):
+    """
+    Bidirectional Adaptive Focal Loss.
+    
+    Dynamically adjusts Alpha and Gamma based on a Target Metric (Recall/Accuracy).
+    
+    Mechanism:
+    - If Metric < Target: INCREASE parameter (Focus more on this class).
+    - If Metric > Target: DECREASE parameter (Relax focus to avoid false positives).
+    
+    Formulas:
+    - alpha_t = base_alpha * (1 + alpha_gain * (target_recall - recall_t))
+    - gamma_t = base_gamma + gamma_gain * (target_accuracy - accuracy_t)
+    
+    Args:
+        base_gamma: Initial gamma (def 2.0)
+        base_alpha: Initial alpha (def 0.25)
+        target_recall: Desired recall (e.g. 0.75). 
+                       If recall < 0.75, alpha increases.
+                       If recall > 0.75, alpha decreases.
+        target_accuracy: Desired accuracy (e.g. 0.95).
+        decay: EMA decay for stats (def 0.99)
+    """
+    def __init__(self, base_gamma=2.0, base_alpha=0.25, 
+                 target_recall=0.75, target_accuracy=0.95,
+                 alpha_gain=1.0, gamma_gain=2.0, 
+                 decay=0.99, epsilon=1e-6, reduction='mean'):
+        super().__init__()
+        self.base_gamma = base_gamma
+        self.base_alpha = base_alpha
+        self.target_recall = target_recall
+        self.target_accuracy = target_accuracy
+        self.alpha_gain = alpha_gain
+        self.gamma_gain = gamma_gain
+        self.decay = decay
+        self.epsilon = epsilon
+        self.reduction = reduction
+        
+        # Stats
+        self.register_buffer('running_tp', torch.ones(1)) 
+        self.register_buffer('running_fn', torch.ones(1)) # Missed Positives
+        self.register_buffer('running_fp', torch.ones(1)) # False Positives (Extra check)
+        self.register_buffer('running_correct', torch.ones(1))
+        self.register_buffer('running_count', torch.ones(1))
+        
+        self.num_classes = None
+
+    def _update_stats(self, logits, targets):
+        if self.num_classes is None:
+            self.num_classes = targets.shape[1]
+            device = targets.device
+            self.running_tp = torch.ones(self.num_classes, device=device)
+            self.running_fn = torch.ones(self.num_classes, device=device)
+            self.running_fp = torch.ones(self.num_classes, device=device)
+            self.running_correct = torch.ones(self.num_classes, device=device)
+            self.running_count = torch.ones(self.num_classes, device=device)
+            
+        if self.running_tp.device != targets.device:
+            self.running_tp = self.running_tp.to(targets.device)
+            self.running_fn = self.running_fn.to(targets.device)
+            self.running_fp = self.running_fp.to(targets.device)
+            self.running_correct = self.running_correct.to(targets.device)
+            self.running_count = self.running_count.to(targets.device)
+            
+        preds = (torch.sigmoid(logits) > 0.5).float()
+        
+        batch_tp = (preds * targets).sum(dim=0)
+        batch_fn = ((1 - preds) * targets).sum(dim=0)
+        batch_fp = (preds * (1 - targets)).sum(dim=0)
+        batch_correct = (preds == targets).float().sum(dim=0)
+        batch_count = targets.shape[0]
+        
+        self.running_tp = self.decay * self.running_tp + (1 - self.decay) * batch_tp
+        self.running_fn = self.decay * self.running_fn + (1 - self.decay) * batch_fn
+        self.running_fp = self.decay * self.running_fp + (1 - self.decay) * batch_fp
+        self.running_correct = self.decay * self.running_correct + (1 - self.decay) * batch_correct
+        self.running_count = self.decay * self.running_count + (1 - self.decay) * batch_count
+
+    def get_logs(self):
+        with torch.no_grad():
+            # Recall
+            recall = self.running_tp / (self.running_tp + self.running_fn + self.epsilon)
+            # Alpha Delta: (Target - Actual) -> Positive if Recall is low
+            alpha_delta = self.target_recall - recall
+            alpha_factor = 1.0 + (alpha_delta * self.alpha_gain)
+            alpha = self.base_alpha * alpha_factor
+            alpha = torch.clamp(alpha, min=0.01, max=0.99)
+            
+            # Accuracy
+            acc = self.running_correct / (self.running_count + self.epsilon)
+            # Gamma Delta: (Target - Actual) -> Positive if Acc is low
+            gamma_delta = self.target_accuracy - acc
+            gamma = self.base_gamma + (gamma_delta * self.gamma_gain)
+            gamma = torch.clamp(gamma, min=0.0, max=10.0)
+            
+            return {
+                "mean_alpha": alpha.mean().item(),
+                "mean_gamma": gamma.mean().item(),
+                "mean_recall": recall.mean().item(),
+                "mean_acc": acc.mean().item()
+            }
+
+    def forward(self, logits, targets):
+        if self.training:
+            with torch.no_grad():
+                self._update_stats(logits, targets)
+        
+        # --- Alpha Adaptation (Recall Based) ---
+        recall = self.running_tp / (self.running_tp + self.running_fn + self.epsilon)
+        # If Recall < Target -> (Target - Recall) > 0 -> Increase Alpha
+        # If Recall > Target -> (Target - Recall) < 0 -> Decrease Alpha
+        alpha_delta = self.target_recall - recall
+        alpha_factor = 1.0 + (alpha_delta * self.alpha_gain)
+        alpha = self.base_alpha * alpha_factor
+        alpha = torch.clamp(alpha, min=0.01, max=0.99)
+        
+        # --- Gamma Adaptation (Accuracy Based) ---
+        acc = self.running_correct / (self.running_count + self.epsilon)
+        # If Acc < Target -> Increase Gamma
+        gamma_delta = self.target_accuracy - acc
+        gamma = self.base_gamma + (gamma_delta * self.gamma_gain)
+        gamma = torch.clamp(gamma, min=0.0, max=10.0)
+        
+        # --- Loss Calc ---
+        probs = torch.sigmoid(logits)
+        p_t = probs * targets + (1 - probs) * (1 - targets)
+        
+        # Alpha term
+        alpha_t = alpha * targets + (1 - alpha) * (1 - targets)
+        
+        # Focal Term: (1 - p_t)^gamma (Broadcasting gamma)
+        gamma_broadcast = gamma.unsqueeze(0)
+        focal_term = (1 - p_t) ** gamma_broadcast
+        
+        bce_loss = F.binary_cross_entropy_with_logits(logits, targets, reduction='none')
+        
+        loss = alpha_t * focal_term * bce_loss
+        
+        if self.reduction == 'mean':
+            return loss.mean()
+        elif self.reduction == 'sum':
+            return loss.sum()
+        else:
+            return loss
+
+# ==========================
+# 15. Learnable Focal Loss (Gradient Descent)
+# ==========================
+class LearnableFocalLoss(nn.Module):
+    """
+    Learnable Focal Loss: Alpha and Gamma are parameters trained by the optimizer.
+    """
+    def __init__(self, init_gamma=2.0, init_alpha=0.25, reduction='mean'):
+        super().__init__()
+        import math
+        # Initialize logits for alpha so sigmoid(logit) = init_alpha
+        # sigmoid(x) = p => x = log(p / (1-p))
+        init_alpha = float(init_alpha)
+        self.param_alpha = nn.Parameter(torch.tensor(math.log(init_alpha / (1.0 - init_alpha))))
+        
+        # Initialize param for gamma so softplus(param) = init_gamma
+        # softplus(x) = log(1 + exp(x)) => x = log(exp(gamma) - 1)
+        init_gamma = float(init_gamma)
+        self.param_gamma = nn.Parameter(torch.log(torch.exp(torch.tensor(init_gamma)) - 1))
+        
+        self.reduction = reduction
+
+    def get_logs(self):
+        with torch.no_grad():
+            alpha = torch.sigmoid(self.param_alpha)
+            gamma = F.softplus(self.param_gamma)
+            return {
+                "mean_alpha": alpha.item(),
+                "mean_gamma": gamma.item(),
+            }
+
+    def forward(self, logits, targets):
+        # Constrain parameters
+        alpha = torch.sigmoid(self.param_alpha)
+        gamma = F.softplus(self.param_gamma)
+        
+        # --- Loss Calculation ---
+        probs = torch.sigmoid(logits)
+        p_t = probs * targets + (1 - probs) * (1 - targets)
+        
+        # Alpha balancing
+        alpha_t = alpha * targets + (1 - alpha) * (1 - targets)
+        
+        # Focal Term
+        focal_term = (1 - p_t) ** gamma
+        
+        bce_loss = F.binary_cross_entropy_with_logits(logits, targets, reduction='none')
+        
+        loss = alpha_t * focal_term * bce_loss
+        
+        if self.reduction == 'mean':
+            return loss.mean()
+        elif self.reduction == 'sum':
+            return loss.sum()
+        else:
+            return loss
+
+# ==========================
+# 16. Self-Tuning Focal Loss (Parameter Free)
+# ==========================
+class SelfTuningFocalLoss(nn.Module):
+    """
+    Self-Tuning Focal Loss: No manual targets, no optimization.
+    
+    Logic:
+    - Alpha tries to fix Recall: alpha = (1 - Recall)
+      * Low Recall (0.1) -> High Alpha (0.9)
+      * High Recall (0.9) -> Low Alpha (0.1)
+    
+    - Gamma tries to fix Accuracy: gamma = Accuracy * (max_gamma)
+      * High Accuracy (Good model) -> High Gamma (Focus on hard examples)
+      * Low Accuracy (Bad model) -> Low Gamma (Learn everything)
+      
+    Args:
+        max_alpha: Cap for alpha (def 0.95)
+        max_gamma: Cap for gamma (def 3.0) - More stable than 5.0
+    """
+    def __init__(self, max_gamma=3.0, max_alpha=0.95, min_alpha=0.25, reduction='mean', decay=0.90):
+        super().__init__()
+        self.max_gamma = max_gamma
+        self.max_alpha = max_alpha
+        self.min_alpha = min_alpha
+        self.reduction = reduction
+        self.decay = decay
+        
+        # Stats
+        self.register_buffer('running_tp', torch.zeros(1))
+        self.register_buffer('running_fn', torch.zeros(1)) # Missed
+        self.register_buffer('running_fp', torch.zeros(1)) # False Alarm
+        self.register_buffer('running_correct', torch.zeros(1))
+        self.register_buffer('running_count', torch.zeros(1))
+        self.epsilon = 1e-7
+
+    def _update_stats(self, logits, targets):
+        preds = (torch.sigmoid(logits) > 0.5).float()
+        
+        # Recall (TP / TP+FN)
+        tp = (preds * targets).sum()
+        fn = ((1 - preds) * targets).sum()
+        
+        # Accuracy
+        correct = (preds == targets).float().sum()
+        count = torch.tensor(targets.numel(), device=targets.device)
+        
+        # EMA Update
+        self.running_tp = self.running_tp * self.decay + tp * (1 - self.decay)
+        self.running_fn = self.running_fn * self.decay + fn * (1 - self.decay)
+        self.running_correct = self.running_correct * self.decay + correct * (1 - self.decay)
+        self.running_count = self.running_count * self.decay + count * (1 - self.decay)
+
+    def get_logs(self):
+        with torch.no_grad():
+            recall = self.running_tp / (self.running_tp + self.running_fn + self.epsilon)
+            acc = self.running_correct / (self.running_count + self.epsilon)
+            
+            # Heuristic Logic
+            # Alpha: Inversamente proporcional al Recall pero limitado
+            
+            # Si Recall = 0.0 -> Alpha = min + 1.0*(max-min) = max
+            # Si Recall = 1.0 -> Alpha = min + 0.0*(max-min) = min
+            alpha_range = self.max_alpha - self.min_alpha
+            alpha = self.min_alpha + (1.0 - recall) * alpha_range
+            alpha = torch.clamp(alpha, min=self.min_alpha, max=self.max_alpha)
+            
+            gamma = acc * self.max_gamma
+            gamma = torch.clamp(gamma, min=0.0, max=self.max_gamma)
+            
+            return {
+                "mean_alpha": alpha.item(),
+                "mean_gamma": gamma.item(),
+                "mean_recall": recall.item(),
+                "mean_acc": acc.item()
+            }
+
+    def forward(self, logits, targets):
+        if self.training:
+            with torch.no_grad():
+                self._update_stats(logits, targets)
+        
+        # Get Dynamic Params
+        logs = self.get_logs()
+        alpha_val = logs["mean_alpha"]
+        gamma_val = logs["mean_gamma"]
+        
+        # --- Loss Calculation ---
+        probs = torch.sigmoid(logits)
+        p_t = probs * targets + (1 - probs) * (1 - targets)
+        
+        # Alpha balancing
+        alpha_t = alpha_val * targets + (1 - alpha_val) * (1 - targets)
+        
+        # Focal Term
+        focal_term = (1 - p_t) ** gamma_val
+        
+        bce_loss = F.binary_cross_entropy_with_logits(logits, targets, reduction='none')
+        
+        loss = alpha_t * focal_term * bce_loss
+        
+        if self.reduction == 'mean':
+            return loss.mean()
+        elif self.reduction == 'sum':
+            return loss.sum()
+        else:
+            return loss
+
+# ==========================
+# 17. Soft F1 Loss (Truly Parameter Free)
+# ==========================
+class SoftF1Loss(nn.Module):
+    """
+    Soft F1 Loss: Directly optimizes the F1 Metric.
+    
+    Formula:
+    F1 = 2*TP / (2*TP + FN + FP + epsilon)
+    Loss = 1 - F1
+    
+    Truly parameter-free. No alpha, no gamma.
+    """
+    def __init__(self, reduction='mean'):
+        super().__init__()
+        self.epsilon = 1e-7
+        self.reduction = reduction
+
+    def forward(self, logits, targets):
+        probs = torch.sigmoid(logits)
+        
+        # Calculate Soft Confusion Matrix
+        # TP = p * t
+        tp = (probs * targets).sum(dim=0)
+        
+        # FP = p * (1 - t)
+        fp = (probs * (1 - targets)).sum(dim=0)
+        
+        # FN = (1 - p) * t
+        fn = ((1 - probs) * targets).sum(dim=0)
+        
+        f1 = (2 * tp) / (2 * tp + fp + fn + self.epsilon)
+        loss = 1 - f1
+        
+        if self.reduction == 'mean':
+            return loss.mean()
+        elif self.reduction == 'sum':
+            return loss.sum()
+        else:
+            return loss
+
+# ==========================
+# CORRECTED: Per-Label Weighted Focal Loss
+# ==========================
+class PerLabelWeightedFocalLoss(nn.Module):
+    """
+    Weighted Focal Loss with per-label NORMALIZED alphas.
+    
+    Formula: WFL = -alpha_i · (1-p_t)^γ · log(p_t)
+    
+    Where alpha_i ∈ [0, 1] is the normalized weight for label i.
+    """
+    def __init__(self, alphas, gamma=2.0, reduction='mean'):
+        super().__init__()
+        if isinstance(alphas, list):
+            alphas = torch.tensor(alphas, dtype=torch.float32)
+        self.register_buffer('alphas', alphas)
+        self.gamma = gamma
+        self.reduction = reduction
+    
+    def forward(self, logits, targets):
+        probs = torch.sigmoid(logits)
+        p_t = probs * targets + (1 - probs) * (1 - targets)
+        
+        # Per-label alpha weighting (values in [0, 1])
+        alphas_expanded = self.alphas.unsqueeze(0)  # (1, num_labels)
+        alpha_t = alphas_expanded * targets + (1 - alphas_expanded) * (1 - targets)
+        
+        focal_term = (1 - p_t) ** self.gamma
+        bce_loss = F.binary_cross_entropy_with_logits(logits, targets, reduction='none')
+        loss = alpha_t * focal_term * bce_loss
+        
+        if self.reduction == 'mean':
+            return loss.mean()
+        elif self.reduction == 'sum':
+            return loss.sum()
+        else:
+            return loss
+    
+    def get_logs(self):
+        return {"mean_alpha": self.alphas.mean().item(), "mean_gamma": self.gamma}
+
+
+class LearnableWeightedFocalLoss(nn.Module):
+    """
+    Learnable Weighted Focal Loss: Per-label alphas are fixed, but global alpha and gamma are learnable.
+    """
+    def __init__(self, alphas, init_alpha=0.5, init_gamma=2.0, reduction='mean'):
+        super().__init__()
+        import math
+        
+        if isinstance(alphas, list):
+            alphas = torch.tensor(alphas, dtype=torch.float32)
+        self.register_buffer('alphas', alphas)
+        
+        # Learnable global multiplier
+        init_alpha = float(init_alpha)
+        self.param_alpha = nn.Parameter(torch.tensor(math.log(init_alpha / (1.0 - init_alpha))))
+        
+        init_gamma = float(init_gamma)
+        self.param_gamma = nn.Parameter(torch.log(torch.exp(torch.tensor(init_gamma)) - 1))
+        
+        self.reduction = reduction
+    
+    def get_logs(self):
+        with torch.no_grad():
+            alpha = torch.sigmoid(self.param_alpha)
+            gamma = F.softplus(self.param_gamma)
+            return {"mean_alpha": alpha.item(), "mean_gamma": gamma.item()}
+    
+    def forward(self, logits, targets):
+        alpha = torch.sigmoid(self.param_alpha)
+        gamma = F.softplus(self.param_gamma)
+        
+        probs = torch.sigmoid(logits)
+        p_t = probs * targets + (1 - probs) * (1 - targets)
+        
+        # Combine fixed per-label alphas with learnable global alpha
+        alphas_expanded = self.alphas.unsqueeze(0)
+        weight_t = alpha * alphas_expanded * targets + (1 - alpha) * (1 - alphas_expanded) * (1 - targets)
+        
+        focal_term = (1 - p_t) ** gamma
+        bce_loss = F.binary_cross_entropy_with_logits(logits, targets, reduction='none')
+        loss = weight_t * focal_term * bce_loss
+        
+        if self.reduction == 'mean':
+            return loss.mean()
+        elif self.reduction == 'sum':
+            return loss.sum()
+        else:
+            return loss
+
+# ==========================
+# 18. Robust Focal Loss (The Holy Grail Candidate)
+# ==========================
+class RobustFocalLoss(nn.Module):
+    """
+    Robust Focal Loss: Auto-scales gain based on batch volatility and anchors parameters.
+    Designed to work with High Learning Rates.
+    
+    Mechanisms:
+    1. Momentum-based Adaptation: Uses momentum instead of simple EMA for smoothness.
+    2. Gain Scaling: If batch statistics oscillate, effective gain is reduced.
+    3. Anchor: Pulls Alpha/Gamma towards baseline (0.25, 2.0) to prevent collapse.
+    """
+    def __init__(self, base_gamma=2.0, base_alpha=0.25, 
+                 momentum=0.9, 
+                 max_gain=2.0, 
+                 anchor_weight=0.1, # Weight of the anchor pull
+                 reduction='mean'):
+        super().__init__()
+        self.base_gamma = base_gamma
+        self.base_alpha = base_alpha
+        self.momentum = momentum
+        self.max_gain = max_gain
+        self.anchor_weight = anchor_weight
+        self.reduction = reduction
+        self.epsilon = 1e-6
+        
+        # Current State (Momentum)
+        # We use buffers so they are saved with state_dict but not trained by optimizer
+        self.register_buffer('alpha_velocity', torch.tensor(0.0))
+        self.register_buffer('gamma_velocity', torch.tensor(0.0))
+        
+        # Current Values (starts at base)
+        self.register_buffer('current_alpha', torch.tensor(base_alpha))
+        self.register_buffer('current_gamma', torch.tensor(base_gamma))
+        
+        # Batch Stats
+        self.register_buffer('running_tp', torch.ones(1)) 
+        self.register_buffer('running_fn', torch.ones(1))
+        self.register_buffer('running_correct', torch.ones(1))
+        self.register_buffer('running_count', torch.ones(1))
+
+    def _update_stats(self, logits, targets):
+        preds = (torch.sigmoid(logits) > 0.5).float()
+        
+        batch_tp = (preds * targets).sum() # Global sum for stability
+        batch_fn = ((1 - preds) * targets).sum()
+        batch_correct = (preds == targets).float().sum()
+        batch_count = torch.tensor(targets.numel(), device=targets.device)
+        
+        # 1. Calculate Instant Recall (Global)
+        instant_recall = batch_tp / (batch_tp + batch_fn + self.epsilon)
+        instant_acc = batch_correct / (batch_count + self.epsilon)
+        
+        # 2. Calculate Desired Shifts 
+        # Target Recall is implicitly 1.0 (we always want better recall)
+        # Delta = (1 - Recall) -> Positive. We want to INCREASE Alpha.
+        alpha_delta = (1.0 - instant_recall) * 0.05 # Small step
+        
+        # Target Accuracy is implicitly 1.0
+        # Delta = (1 - Acc) -> Positive. We want to INCREASE Gamma (focus on hard).
+        gamma_delta = (1.0 - instant_acc) * 0.1 # Small step
+        
+        # 3. Update Velocities (Momentum)
+        # v = m * v + (1-m) * delta
+        self.alpha_velocity = self.momentum * self.alpha_velocity + (1 - self.momentum) * alpha_delta
+        self.gamma_velocity = self.momentum * self.gamma_velocity + (1 - self.momentum) * gamma_delta
+        
+        # 4. Update Parameters
+        # Alpha += velocity
+        new_alpha = self.current_alpha + self.alpha_velocity
+        new_gamma = self.current_gamma + self.gamma_velocity
+        
+        # 5. Anchor Pull (Regularization)
+        # Pull towards base values to prevent drift
+        # new_val = val * (1-w) + base * w
+        new_alpha = new_alpha * (1 - self.anchor_weight) + self.base_alpha * self.anchor_weight
+        new_gamma = new_gamma * (1 - self.anchor_weight) + self.base_gamma * self.anchor_weight
+        
+        # 6. Store with clamping
+        self.current_alpha = torch.clamp(new_alpha, min=0.05, max=0.95)
+        self.current_gamma = torch.clamp(new_gamma, min=0.5, max=5.0)
+
+    def get_logs(self):
+        return {
+            "mean_alpha": self.current_alpha.item(),
+            "mean_gamma": self.current_gamma.item(),
+            "alpha_velocity": self.alpha_velocity.item()
+        }
+
+    def forward(self, logits, targets):
+        if self.training:
+            with torch.no_grad():
+                self._update_stats(logits, targets)
+        
+        alpha = self.current_alpha
+        gamma = self.current_gamma
+        
+        probs = torch.sigmoid(logits)
+        p_t = probs * targets + (1 - probs) * (1 - targets)
+        
+        alpha_t = alpha * targets + (1 - alpha) * (1 - targets)
+        
+        # Broadcasting logic
+        # alpha_t is (batch, num_classes)
+        # focal_term should be (batch, num_classes)
+        # gamma is scalar here (global gamma)
+        
+        focal_term = (1 - p_t) ** gamma
+        bce_loss = F.binary_cross_entropy_with_logits(logits, targets, reduction='none')
+        
+        loss = alpha_t * focal_term * bce_loss
+        
+        if self.reduction == 'mean':
+            return loss.mean()
+        elif self.reduction == 'sum':
+            return loss.sum()
+        else:
+            return loss
+

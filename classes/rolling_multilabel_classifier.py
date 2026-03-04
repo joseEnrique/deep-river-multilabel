@@ -204,7 +204,13 @@ class RollingMultiLabelClassifier(RollingDeepEstimator, river_base.MultiLabelCla
         # Rebuild optimizer with the real module's parameters
         from deep_river.utils import get_optim_fn
         optimizer_func = get_optim_fn(self.optimizer_fn)
-        self.optimizer = optimizer_func(self.module.parameters(), lr=self.lr)
+        
+        # Include loss parameters if they exist
+        params = list(self.module.parameters())
+        if isinstance(self.loss_fn, torch.nn.Module):
+             params.extend(list(self.loss_fn.parameters()))
+             
+        self.optimizer = optimizer_func(params, lr=self.lr)
 
         self.module_initialized = True
 
