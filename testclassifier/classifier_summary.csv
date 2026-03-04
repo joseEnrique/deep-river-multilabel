@@ -1,5 +1,0 @@
-,accuracy,accuracy,accuracy,micro_f1,micro_f1,micro_f1,macro_f1,macro_f1,macro_f1,elapsed_time_seconds,elapsed_time_seconds,elapsed_time_seconds,elapsed_time_seconds
-,mean,std,max,mean,std,max,mean,std,max,mean,std,min,max
-classifier_type,,,,,,,,,,,,,
-PretrainedRollingMultiLabel,0.991325,0.001443,0.99298,0.18867,0.050114,0.258873,0.123785,0.032378,0.172418,1885.382,2458.376673,34.87,10435.66
-RollingMultiLabel,0.991611,0.000892,0.99296,0.240741,0.029119,0.288625,0.146721,0.022215,0.184797,1881.81,2463.823199,30.9,10464.46
