@@ -80,10 +80,12 @@ class DirectMultiLabelForecaster(DeepEstimator, river_base.MultiLabelClassifier)
         epochs: int = 1,
         threshold: float = 0.5,
         shift: int = 0,
+        past_history: int = 1,
         **kwargs,
     ):
         # Store parameters
         self.window_size = window_size
+        self.past_history = past_history
         self.label_names = label_names
         self.n_labels = len(label_names)
         self.epochs = epochs
@@ -124,13 +126,14 @@ class DirectMultiLabelForecaster(DeepEstimator, river_base.MultiLabelClassifier)
             seed=seed,
         )
 
-        # Cola para almacenar feature vectors (como listas)
-        # Add buffer for shift
-        # MATCHING ROLLING BEHAVIOR: Use exact window_size if shift=0
-        maxlen = window_size + shift
-        self.x_window = deque(maxlen=maxlen)
-        # Cola para almacenar targets históricos (para entrenar con sub-secuencias)
-        self.y_window = deque(maxlen=maxlen)
+        # Buffer for the past_history tracking of elements (current sequence)
+        self.history_buffer = deque(maxlen=self.past_history)
+        
+        # Buffer for batches of sequences and targets
+        # The window stores window_size elements, each being a sequence of length past_history
+        maxlen_window = self.window_size + self.shift
+        self.sequence_window = deque(maxlen=maxlen_window)
+        self.target_window = deque(maxlen=maxlen_window)
         # Track observed features for consistent ordering
         from sortedcontainers import SortedSet
         self.observed_features = SortedSet()
@@ -242,8 +245,7 @@ class DirectMultiLabelForecaster(DeepEstimator, river_base.MultiLabelClassifier)
             print(f"⚠ Warning: New features detected ({prev_num_features} -> {len(self.observed_features)}). Reinitializing model...")
             first_row = x_df.iloc[0].to_dict()
             first_row_features = {k: v for k, v in first_row.items() if k not in self.label_names}
-            self._initialize_module(first_row_features)
-            self.x_window.clear()
+            self.history_buffer.clear()
             self.y_window.clear()
             # Clear sequence buffers as well (feature dimension changed)
             if hasattr(self, 'sequence_buffer'):
@@ -316,10 +318,10 @@ class DirectMultiLabelForecaster(DeepEstimator, river_base.MultiLabelClassifier)
         for _ in range(self.epochs):
             self._learn(x_t, y_t)
 
-        # Keep x_window for predict_one compatibility
-        self.x_window.clear()
+        # Keep history_buffer for predict_one compatibility
+        self.history_buffer.clear()
         for x_vec in x_sequence:
-            self.x_window.append(x_vec)
+            self.history_buffer.append(x_vec)
         self.y_window.clear()
         self.y_window.append(y_vec)
         return self
@@ -340,33 +342,40 @@ class DirectMultiLabelForecaster(DeepEstimator, river_base.MultiLabelClassifier)
         if len(self.observed_features) > prev_num_features:
             print(f"⚠ Warning: New features detected ({prev_num_features} -> {len(self.observed_features)}). Reinitializing model...")
             self._initialize_module(x)
-            self.x_window.clear()
+            self.history_buffer.clear()
+            self.sequence_window.clear()
+            self.target_window.clear()
             # Clear sequence buffers as well (feature dimension changed)
             if hasattr(self, 'sequence_buffer'):
                 self.sequence_buffer.clear()
                 self.target_buffer.clear()
 
         # Convert x dict to feature vector using observed feature order
+        if len(self.sequence_window) > 0 and len(self.sequence_window[-1][0]) != len(self.observed_features):
+            self.sequence_window.clear()
+            self.target_window.clear()
+            self.history_buffer.clear()
+            
         x_vec = [x.get(feature, 0) for feature in self.observed_features]
 
-        # Append to window
-        self.x_window.append(x_vec)
+        # Append to history buffer
+        self.history_buffer.append(x_vec)
+
+        # Build current sequence (pad to past_history if needed)
+        current_seq = list(self.history_buffer)
+        if len(current_seq) < self.past_history:
+            pad = [[0.0] * len(self.observed_features)] * (self.past_history - len(current_seq))
+            current_seq = pad + current_seq
+            
+        self.sequence_window.append(current_seq)
+        
+        y_vec = [float(y.get(label, 0)) for label in self.label_names]
+        self.target_window.append(y_vec)
 
         # Train at every step using the current window (even if not full yet)
-        # This matches RollingMultiLabelClassifier behavior
-        if len(self.x_window) > 0:
-            # Convert window to tensor using deque2rolling_tensor (matches Rolling)
-            # Returns [seq_len, batch=1, n_features]
-            x_t = deque2rolling_tensor(self.x_window, device=self.device)
-            # Convert to batch_first [batch=1, seq_len, n_features]
-            x_t = x_t.permute(1, 0, 2).contiguous()
-
-            # Convert y dict to tensor: [batch=1, n_labels]
-            y_t = torch.tensor(
-                [[float(y.get(label, 0)) for label in self.label_names]],
-                dtype=torch.float32,
-                device=self.device
-            )
+        if len(self.sequence_window) > 0:
+            x_t = torch.tensor(list(self.sequence_window), dtype=torch.float32, device=self.device)
+            y_t = torch.tensor(list(self.target_window), dtype=torch.float32, device=self.device)
 
             # Ensure module is in training mode
             self.module.train()
@@ -495,7 +504,7 @@ class DirectMultiLabelForecaster(DeepEstimator, river_base.MultiLabelClassifier)
                 probs = logits
 
             # Convert to binary predictions using threshold
-            preds = (probs > self.threshold).cpu().numpy()[0]
+            preds = (probs >= self.threshold).cpu().numpy()[0]
 
             # Return as dict
             return {label: int(pred) for label, pred in zip(self.label_names, preds)}
@@ -516,28 +525,23 @@ class DirectMultiLabelForecaster(DeepEstimator, river_base.MultiLabelClassifier)
         if len(self.observed_features) > prev_num_features:
             print(f"⚠ Warning: New features detected in predict ({prev_num_features} -> {len(self.observed_features)}). Reinitializing model...")
             self._initialize_module(x)
-            self.x_window.clear()
 
-        # Prepare window copy including current x
+        # Check if we have enough context (RollingMultiLabelClassifier equivalence)
+        if len(self.sequence_window) + 1 < self.window_size:
+            # Not enough context; return zeros
+            return {label: 0 for label in self.label_names}
+
+        # Prepare history copy including current x
         x_vec = [x.get(feature, 0) for feature in self.observed_features]
-        x_win = list(self.x_window) + [x_vec]
+        current_history = list(self.history_buffer) + [x_vec]
+        current_history = current_history[-self.past_history:]
 
-        # If we don't have any history yet, just use current instance
-        if len(x_win) == 0:
-            return {label: False for label in self.label_names}
+        # If we don't have enough history, pad to past_history
+        if len(current_history) < self.past_history:
+            pad = [[0.0] * len(self.observed_features)] * (self.past_history - len(current_history))
+            current_history = pad + current_history
 
-        # Take last window_size elements (or all if less than window_size)
-        x_win = x_win[-self.window_size:] if len(x_win) > self.window_size else x_win
-
-        # Convert window list to deque for deque2rolling_tensor
-        from collections import deque as temp_deque
-        x_win_deque = temp_deque(x_win, maxlen=len(x_win))
-        
-        # Convert to tensor using deque2rolling_tensor (matches Rolling)
-        # Returns [seq_len, batch=1, n_features]
-        x_t = deque2rolling_tensor(x_win_deque, device=self.device)
-        # Convert to batch_first [batch=1, seq_len, n_features]
-        x_t = x_t.permute(1, 0, 2).contiguous()
+        x_t = torch.tensor([current_history], dtype=torch.float32, device=self.device)
 
         # Predict
         self.module.eval()
@@ -549,7 +553,7 @@ class DirectMultiLabelForecaster(DeepEstimator, river_base.MultiLabelClassifier)
                 y_pred = torch.sigmoid(y_pred)
 
             # Convert to binary predictions (threshold=self.threshold)
-            y_pred_binary = (y_pred > self.threshold).squeeze(0).cpu().numpy()
+            y_pred_binary = (y_pred >= self.threshold).squeeze(0).cpu().numpy()
 
         # Convert to dictionary
         return {label: int(pred) for label, pred in zip(self.label_names, y_pred_binary)}
@@ -575,32 +579,38 @@ class DirectMultiLabelForecaster(DeepEstimator, river_base.MultiLabelClassifier)
         if isinstance(x, pd.DataFrame):
             return self._predict_proba_sequence(x)
 
-        # Initialize if needed
+        # Ensure model is initialized
         if not self.module_initialized:
             self._update_observed_features(x)
             self._initialize_module(x)
 
-        # Check for new features and reinitialize if needed
+        if len(self.observed_features) == 0:
+            return {label: 0.0 for label in self.label_names}
+
         prev_num_features = len(self.observed_features)
         self._update_observed_features(x)
+
         if len(self.observed_features) > prev_num_features:
             print(f"⚠ Warning: New features detected in predict_proba ({prev_num_features} -> {len(self.observed_features)}). Reinitializing model...")
             self._initialize_module(x)
-            self.x_window.clear()
+            self.history_buffer.clear()
 
-        # Prepare window copy including current x (matches Rolling exactly)
-        x_win = self.x_window.copy()
-        x_win.append([x.get(feature, 0) for feature in self.observed_features])
-
-        # Check if we have enough context (AFTER adding current x)
-        if len(x_win) < self.window_size:
+        # Check if we have enough context (RollingMultiLabelClassifier equivalence)
+        if len(self.sequence_window) + 1 < self.window_size:
             # Not enough context; return zeros
             return {label: 0.0 for label in self.label_names}
 
-        # Convert to tensor using deque2rolling_tensor (matches Rolling)
-        x_t = deque2rolling_tensor(x_win, device=self.device)
-        # Convert to batch_first [batch=1, seq_len, n_features]
-        x_t = x_t.permute(1, 0, 2).contiguous()
+        # Prepare history copy including current x
+        x_vec = [x.get(feature, 0) for feature in self.observed_features]
+        current_history = list(self.history_buffer) + [x_vec]
+        current_history = current_history[-self.past_history:]
+
+        # If we don't have enough history, pad to past_history
+        if len(current_history) < self.past_history:
+            pad = [[0.0] * len(self.observed_features)] * (self.past_history - len(current_history))
+            current_history = pad + current_history
+
+        x_t = torch.tensor([current_history], dtype=torch.float32, device=self.device)
 
         # Predict
         self.module.eval()
