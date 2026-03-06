@@ -2,7 +2,7 @@
 RollingAi4i Dataset - Generates rolling window sequences from Ai4i dataset.
 
 This dataset wrapper takes the Ai4i dataset and yields sequences (DataFrames)
-instead of individual instances (dicts). Compatible with DirectMultiLabelForecaster.
+instead of individual instances (dicts). Compatible with RollingMultiLabelClassifierSequences.
 """
 
 import pandas as pd

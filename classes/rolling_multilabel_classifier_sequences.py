@@ -1,8 +1,8 @@
 """
-Direct Multi-Label Forecaster para clasificación multi-label con ventanas temporales.
+Direct Multi-Label Classifier for sequences with temporal windows.
 
-Esta clase extiende DeepForecaster para trabajar con DataFrames como entrada
-y mantener una ventana de instancias para entrenamiento multi-label.
+Esta clase extiende DeepEstimator para trabajar con DataFrames como entrada
+y mantener una ventana de secuencias para entrenamiento multi-label.
 """
 
 import torch
@@ -16,9 +16,9 @@ from deep_river.utils.tensor_conversion import deque2rolling_tensor
 from river import base as river_base
 
 
-class DirectMultiLabelForecaster(DeepEstimator, river_base.MultiLabelClassifier):
+class RollingMultiLabelClassifierSequences(DeepEstimator, river_base.MultiLabelClassifier):
     """
-    A simplified DeepForecaster for multi-label classification with DataFrame inputs.
+    A simplified DeepEstimator for multi-label classification with sequence tracking.
 
     This class extends DeepEstimator to work with DataFrame inputs and maintains
     a window of instances for training multi-label models.
@@ -51,9 +51,9 @@ class DirectMultiLabelForecaster(DeepEstimator, river_base.MultiLabelClassifier)
     Example
     -------
     >>> from testclassifier.model import LSTM_MultiLabel
-    >>> from classes.direct_multilabel_forecaster import DirectMultiLabelForecaster
+    >>> from classes.rolling_multilabel_classifier_sequences import RollingMultiLabelClassifierSequences
     >>>
-    >>> forecaster = DirectMultiLabelForecaster(
+    >>> forecaster = RollingMultiLabelClassifierSequences(
     ...     window_size=100,
     ...     label_names=['TWF', 'HDF', 'PWF', 'OSF', 'RNF'],
     ...     module=LSTM_MultiLabel,
@@ -79,7 +79,6 @@ class DirectMultiLabelForecaster(DeepEstimator, river_base.MultiLabelClassifier)
         seed: int = 42,
         epochs: int = 1,
         threshold: float = 0.5,
-        shift: int = 0,
         past_history: int = 1,
         **kwargs,
     ):
@@ -91,7 +90,6 @@ class DirectMultiLabelForecaster(DeepEstimator, river_base.MultiLabelClassifier)
         self.epochs = epochs
         self.output_is_logit = output_is_logit
         self.threshold = threshold
-        self.shift = shift
 
         # Store module class and kwargs for later initialization
         self.module_cls = module
@@ -131,9 +129,11 @@ class DirectMultiLabelForecaster(DeepEstimator, river_base.MultiLabelClassifier)
         
         # Buffer for batches of sequences and targets
         # The window stores window_size elements, each being a sequence of length past_history
-        maxlen_window = self.window_size + self.shift
-        self.sequence_window = deque(maxlen=maxlen_window)
-        self.target_window = deque(maxlen=maxlen_window)
+        self.sequence_window = deque(maxlen=self.window_size)
+        self.target_window = deque(maxlen=self.window_size)
+        # Plain feature-vector window used for prediction (mirrors RollingMultiLabelClassifier._x_window)
+        # This guarantees the same tensor memory layout for identical GPU float arithmetic
+        self._x_window = deque(maxlen=self.window_size)
         # Track observed features for consistent ordering
         from sortedcontainers import SortedSet
         self.observed_features = SortedSet()
@@ -345,6 +345,7 @@ class DirectMultiLabelForecaster(DeepEstimator, river_base.MultiLabelClassifier)
             self.history_buffer.clear()
             self.sequence_window.clear()
             self.target_window.clear()
+            self._x_window.clear()
             # Clear sequence buffers as well (feature dimension changed)
             if hasattr(self, 'sequence_buffer'):
                 self.sequence_buffer.clear()
@@ -355,11 +356,14 @@ class DirectMultiLabelForecaster(DeepEstimator, river_base.MultiLabelClassifier)
             self.sequence_window.clear()
             self.target_window.clear()
             self.history_buffer.clear()
+            self._x_window.clear()
             
         x_vec = [x.get(feature, 0) for feature in self.observed_features]
 
-        # Append to history buffer
+        # Append to history buffer (for past_history sequences)
         self.history_buffer.append(x_vec)
+        # Append raw vec to flat window (mirrors RollingMultiLabelClassifier for identical prediction)
+        self._x_window.append(x_vec)
 
         # Build current sequence (pad to past_history if needed)
         current_seq = list(self.history_buffer)
@@ -377,12 +381,14 @@ class DirectMultiLabelForecaster(DeepEstimator, river_base.MultiLabelClassifier)
             x_t = torch.tensor(list(self.sequence_window), dtype=torch.float32, device=self.device)
             y_t = torch.tensor(list(self.target_window), dtype=torch.float32, device=self.device)
 
-            # Ensure module is in training mode
-            self.module.train()
-
-            # Train for multiple epochs
+            # Train for multiple epochs - match RollingMultiLabelClassifier's exact loop structure
             for _ in range(self.epochs):
-                self._learn(x_t, y_t)
+                self.module.train()
+                self.optimizer.zero_grad()
+                logits = self.module(x_t)
+                loss = self.loss_fn(logits, y_t)
+                loss.backward()
+                self.optimizer.step()
 
         return self
 
@@ -600,24 +606,22 @@ class DirectMultiLabelForecaster(DeepEstimator, river_base.MultiLabelClassifier)
             # Not enough context; return zeros
             return {label: 0.0 for label in self.label_names}
 
-        # Prepare history copy including current x
+        # To exactly replicate RollingMultiLabelClassifier's prediction tensor:
+        # Use the flat _x_window (raw feature vectors) + current x as the batch.
+        # This ensures the same GPU memory layout -> identical float arithmetic -> identical metrics.
         x_vec = [x.get(feature, 0) for feature in self.observed_features]
-        current_history = list(self.history_buffer) + [x_vec]
-        current_history = current_history[-self.past_history:]
+        x_win = list(self._x_window) + [x_vec]
 
-        # If we don't have enough history, pad to past_history
-        if len(current_history) < self.past_history:
-            pad = [[0.0] * len(self.observed_features)] * (self.past_history - len(current_history))
-            current_history = pad + current_history
-
-        x_t = torch.tensor([current_history], dtype=torch.float32, device=self.device)
+        # Wrap each feature vector into [seq_len=1, features] to match [batch, 1, features] shape
+        x_win_batched = [[v] for v in x_win]
+        x_t = torch.tensor(x_win_batched, dtype=torch.float32, device=self.device)
 
         # Predict
         self.module.eval()
         with torch.inference_mode():
             logits = self.module(x_t)
-            # Always apply sigmoid (matches Rolling)
-            probs = torch.sigmoid(logits).squeeze(0).detach().cpu().tolist()
+            # Take last element [-1] and apply sigmoid (same as RollingMultiLabelClassifier)
+            probs = torch.sigmoid(logits[-1]).detach().cpu().tolist()
 
         # Convert to dictionary
         return {t: float(probs[i]) for i, t in enumerate(self.label_names)}
@@ -681,96 +685,7 @@ class DirectMultiLabelForecaster(DeepEstimator, river_base.MultiLabelClassifier)
         return {label: float(proba) for label, proba in zip(self.label_names, y_proba)}
 
 
-    def _df_to_tensor(self, df):
-        """
-        Convert a DataFrame to a tensor with proper feature ordering.
 
-        Parameters
-        ----------
-        df : pd.DataFrame
-            The DataFrame to convert.
-
-        Returns
-        -------
-        torch.Tensor
-            A tensor with shape [seq_len, n_features] using observed_features order.
-        """
-        import pandas as pd
-
-        if not isinstance(df, pd.DataFrame):
-            raise TypeError(f"Expected DataFrame, got {type(df)}")
-
-        # Convert DataFrame to tensor using observed feature order
-        data = []
-        for _, row in df.iterrows():
-            row_vec = [row.get(feature, 0) if feature in row.index else 0
-                      for feature in self.observed_features]
-            data.append(row_vec)
-
-        tensor = torch.tensor(data, dtype=torch.float32, device=self.device)
-        return tensor
-
-    def forecast(self, horizon: int, xs=None) -> List[Dict[str, bool]]:
-        """
-        Forecast the next `horizon` steps.
-
-        If horizon=0, returns the prediction for the current step only.
-
-        Parameters
-        ----------
-        horizon : int
-            The number of steps to forecast.
-        xs : pd.DataFrame, optional
-            The input DataFrame instance for prediction.
-
-        Returns
-        -------
-        List[Dict[str, bool]]
-            A list of predicted multi-label dictionaries.
-        """
-        if xs is None:
-            raise ValueError("xs cannot be None for forecasting")
-
-        # Initialize module if needed
-        if not self.module_initialized:
-            first_row = xs.iloc[0].to_dict()
-            self._update_observed_features(first_row)
-            self._initialize_module(first_row)
-
-        # Update observed features from DataFrame
-        for col in xs.columns:
-            if col not in self.observed_features:
-                self.observed_features.add(col)
-
-        # Set module to eval mode
-        self.module.eval()
-
-        # Convertir DataFrame a tensor
-        x_t = self._df_to_tensor(xs)
-
-        # Añadir batch dimension si no existe
-        if x_t.dim() == 2:
-            x_t = x_t.unsqueeze(0)  # [1, seq_len, features]
-
-        predictions = []
-
-        # Forecast para cada horizonte
-        for h in range(horizon):
-            with torch.no_grad():
-                y_pred = self.module(x_t)
-
-                # Aplicar sigmoid si el output es logit
-                if self.output_is_logit:
-                    y_pred = torch.sigmoid(y_pred)
-
-                # Convertir a predicciones binarias
-                y_pred_binary = (y_pred > 0.5).cpu().numpy().flatten()
-
-                # Añadir a lista de predicciones
-                pred_dict = {label: bool(pred) for label, pred in zip(self.label_names, y_pred_binary)}
-                predictions.append(pred_dict)
-
-        return predictions
     def _learn(self, x: torch.Tensor, y: torch.Tensor):
         """
         Perform a single training step.
@@ -810,9 +725,6 @@ class DirectMultiLabelForecaster(DeepEstimator, river_base.MultiLabelClassifier)
         # Compute loss
         loss = self.loss_fn(logits, y)
         
-        # Compute loss
-        loss = self.loss_fn(logits, y)
-        
         # Backward pass
         loss.backward()
         
@@ -821,7 +733,7 @@ class DirectMultiLabelForecaster(DeepEstimator, river_base.MultiLabelClassifier)
         #     print(f"DEBUG _learn: x.shape={x.shape}, y.shape={y.shape}, loss={loss.item():.6f}")
         
         # Clip gradients - ENABLED to prevent exploding gradients
-        torch.nn.utils.clip_grad_norm_(self.module.parameters(), max_norm=1.0)
+        # torch.nn.utils.clip_grad_norm_(self.module.parameters(), max_norm=1.0)
         
         # Optimizer step
         self.optimizer.step()

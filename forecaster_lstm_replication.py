@@ -1,8 +1,8 @@
 """
-Replication of LSTM Window Search with DirectMultiLabelForecaster and varying past_size.
+Replication of LSTM Window Search with RollingMultiLabelClassifierSequences and varying past_size.
 
 This script replicates the configurations from lstm_window_size_search.py but uses
-DirectMultiLabelForecaster and tests with past_size=[1, 5, 10] to evaluate the impact
+RollingMultiLabelClassifierSequences and tests with past_size=[1, 5, 10] to evaluate the impact
 of historical context from the dataset stream on model performance.
 
 EJECUCIÓN EN PARALELO: Usa 2 GPUs (cuda:0 y cuda:1) simultáneamente.
@@ -12,7 +12,7 @@ import torch
 import pandas as pd
 from datetime import datetime
 from testclassifier.model import LSTM_MultiLabel
-from classes.direct_multilabel_forecaster import DirectMultiLabelForecaster
+from classes.rolling_multilabel_classifier_sequences import RollingMultiLabelClassifierSequences
 from datasets.multioutput import RollingAi4i
 from river import compose, preprocessing
 from river.metrics import F1
@@ -158,7 +158,7 @@ def run_single_experiment(args):
 
         # Create forecaster
         # Note: Passing dropout and bidirectional via kwargs
-        forecaster = DirectMultiLabelForecaster(
+        forecaster = RollingMultiLabelClassifierSequences(
             window_size=config['window_size'],
             label_names=target_names,
             module=LSTM_MultiLabel,
@@ -262,7 +262,7 @@ if __name__ == '__main__':
     os.makedirs(output_dir, exist_ok=True)
     
     print("="*80)
-    print("REPLICACIÓN DE LSTM WINDOW SEARCH - DirectMultiLabelForecaster")
+    print("REPLICACIÓN DE LSTM WINDOW SEARCH - RollingMultiLabelClassifierSequences")
     print(f"Testing past_size values: 1, 5, 10")
     print("="*80)
     print(f"Inicio del experimento: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")

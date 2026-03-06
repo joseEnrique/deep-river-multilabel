@@ -1,5 +1,5 @@
 """
-Búsqueda exhaustiva de hiperparámetros para DirectMultiLabelForecaster.
+Búsqueda exhaustiva de hiperparámetros para RollingMultiLabelClassifierSequences.
 
 Este script prueba diferentes configuraciones de:
 - Learning rates
@@ -18,7 +18,7 @@ import torch
 import pandas as pd
 from datetime import datetime
 from testclassifier.model import LSTM_MultiLabel, FocalLoss
-from classes.direct_multilabel_forecaster import DirectMultiLabelForecaster
+from classes.rolling_multilabel_classifier_sequences import RollingMultiLabelClassifierSequences
 from datasets.multioutput import RollingAi4i
 from river import compose, preprocessing
 from river.metrics import F1
@@ -118,7 +118,7 @@ def run_single_experiment(args):
             raise ValueError(f"Unknown loss function: {config['loss']}")
 
         # Create forecaster with FocalLoss params from config
-        forecaster = DirectMultiLabelForecaster(
+        forecaster = RollingMultiLabelClassifierSequences(
             window_size=config['window_size'],
             label_names=target_names,
             module=LSTM_MultiLabel,
@@ -221,7 +221,7 @@ if __name__ == '__main__':
         pass  # Already set
     
     print("="*80)
-    print("BÚSQUEDA DE HIPERPARÁMETROS - DirectMultiLabelForecaster")
+    print("BÚSQUEDA DE HIPERPARÁMETROS - RollingMultiLabelClassifierSequences")
     print("="*80)
     print(f"Inicio del experimento: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"Total de configuraciones: {len(configs)}")

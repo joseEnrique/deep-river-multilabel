@@ -1,6 +1,6 @@
 import torch
 from classes.rolling_multilabel_classifier import RollingMultiLabelClassifier
-from classes.direct_multilabel_forecaster import DirectMultiLabelForecaster
+from classes.rolling_multilabel_classifier_sequences import RollingMultiLabelClassifierSequences
 from testclassifier.model import LSTM_MultiLabel
 
 target_names = ['TWF', 'HDF', 'PWF', 'OSF', 'RNF']
@@ -30,7 +30,7 @@ def test_models():
     )
     
     # 2. Init Direct
-    direct = DirectMultiLabelForecaster(
+    direct = RollingMultiLabelClassifierSequences(
         window_size=3,
         past_history=1,
         label_names=target_names,
@@ -46,7 +46,6 @@ def test_models():
         seed=42,
         epochs=1,
         loss_fn=torch.nn.BCEWithLogitsLoss(),
-        shift=0
     )
     
     # Generate some fake inputs

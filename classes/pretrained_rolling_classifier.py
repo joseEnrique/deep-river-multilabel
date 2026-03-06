@@ -8,6 +8,7 @@ from deep_river.base import RollingDeepEstimator
 from deep_river.utils.tensor_conversion import deque2rolling_tensor
 from river import base as river_base
 
+#NO UPDATED
 
 class PretrainedRollingMultiLabelClassifier(RollingDeepEstimator, river_base.MultiLabelClassifier):
     """

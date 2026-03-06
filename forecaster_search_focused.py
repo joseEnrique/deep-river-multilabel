@@ -1,5 +1,5 @@
 """
-Búsqueda FOCALIZADA de hiperparámetros para DirectMultiLabelForecaster.
+Búsqueda FOCALIZADA de hiperparámetros para RollingMultiLabelClassifierSequences.
 
 Enfoque:
 - Loss: WeightedBCE (optimización de pesos)
@@ -13,7 +13,7 @@ import torch
 import pandas as pd
 from datetime import datetime
 from testclassifier.model import LSTM_MultiLabel, FocalLoss, AdaptiveWeightedBCE
-from classes.direct_multilabel_forecaster import DirectMultiLabelForecaster
+from classes.rolling_multilabel_classifier_sequences import RollingMultiLabelClassifierSequences
 from datasets.multioutput import RollingAi4i
 from river import compose, preprocessing
 from river.metrics import F1
@@ -100,7 +100,7 @@ def run_single_experiment(args):
             loss_fn = torch.nn.BCEWithLogitsLoss(pos_weight=pos_weight)
 
         # Create forecaster
-        forecaster = DirectMultiLabelForecaster(
+        forecaster = RollingMultiLabelClassifierSequences(
             window_size=config['window_size'],
             label_names=target_names,
             module=LSTM_MultiLabel,
@@ -198,7 +198,7 @@ if __name__ == '__main__':
         pass  # Already set
     
     print("="*80)
-    print("BÚSQUEDA FOCALIZADA - DirectMultiLabelForecaster")
+    print("BÚSQUEDA FOCALIZADA - RollingMultiLabelClassifierSequences")
     print("="*80)
     print(f"Inicio del experimento: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"Total de configuraciones: {len(configs)}")
