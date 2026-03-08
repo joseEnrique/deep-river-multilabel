@@ -30,7 +30,7 @@ from datasets.multioutput import Ai4i
 from datasets.multioutput.nps import NPS
 from classes.rolling_multilabel_classifier_sequences import RollingMultiLabelClassifierSequences
 from testclassifier.model import (
-    LSTM_MultiLabel, MLP_MultiLabel,
+    LSTM_MultiLabel, MLP_MultiLabel, CNN_MultiLabel, Transformer_MultiLabel,
     FocalLoss, AdaptiveFocalLoss,
 )
 import evaluate as _evaluate
@@ -56,6 +56,8 @@ DATASETS = {
 ARCHITECTURES = {
     "LSTM": LSTM_MultiLabel,
     "MLP":  MLP_MultiLabel,
+    "CNN":  CNN_MultiLabel,
+    "Transformer": Transformer_MultiLabel,
 }
 
 

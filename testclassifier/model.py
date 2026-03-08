@@ -12,6 +12,17 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+class SafeBatchNorm1d(nn.BatchNorm1d):
+    """
+    Prevents ValueError when training with batch_size=1 (common in online learning).
+    Skips batch norm and returns input unchanged for single-element batches during training.
+    """
+    def forward(self, input):
+        if self.training and input.size(0) == 1:
+            return input
+        return super().forward(input)
+
+
 
 #%%
 # ==========================
@@ -206,9 +217,10 @@ class AdaptiveWeightedBCE(nn.Module):
 # ==========================
 class LSTM_MultiLabel(nn.Module):
     def __init__(self, input_dim, hidden_dim, output_dim,
-                 num_layers=2, dropout=0.3, bidirectional=True):
+                 num_layers=2, dropout=0.3, bidirectional=True, normalization="none"):
         super().__init__()
         self.bidirectional = bidirectional
+        self.normalization = str(normalization).lower()
         self.lstm = nn.LSTM(
             input_dim, hidden_dim, num_layers,
             batch_first=True,
@@ -217,6 +229,14 @@ class LSTM_MultiLabel(nn.Module):
         )
         self.dropout = nn.Dropout(dropout)
         direction_factor = 2 if bidirectional else 1
+        
+        if self.normalization == "layernorm":
+            self.norm = nn.LayerNorm(hidden_dim * direction_factor)
+        elif self.normalization == "batchnorm":
+            self.norm = SafeBatchNorm1d(hidden_dim * direction_factor)
+        else:
+            self.norm = nn.Identity()
+            
         self.fc = nn.Linear(hidden_dim * direction_factor, output_dim)
 
     def forward(self, x):
@@ -226,6 +246,7 @@ class LSTM_MultiLabel(nn.Module):
         else:
             last_hidden = hn[-1]
         last_hidden = self.dropout(last_hidden)
+        last_hidden = self.norm(last_hidden)
         logits = self.fc(last_hidden)
         return logits
 
@@ -248,23 +269,28 @@ class MLP_MultiLabel(nn.Module):
     - Input: 7 features (Air temp, Process temp, Rotational speed, Torque, Tool wear, Type_encoded)
     - Output: 5 labels (TWF, HDF, PWF, OSF, RNF)
     """
-    def __init__(self, input_dim, hidden_dims=[128, 64, 32], output_dim=5, dropout=0.3):
+    def __init__(self, input_dim, hidden_dims=[128, 64, 32], output_dim=5, dropout=0.3, normalization="none"):
         """
         Args:
             input_dim: Dimensión de entrada (número de features)
             hidden_dims: Lista con dimensiones de capas ocultas
             output_dim: Dimensión de salida (número de labels)
             dropout: Tasa de dropout para regularización
+            normalization: "batchnorm", "layernorm", or "none"
         """
         super().__init__()
 
         layers = []
         prev_dim = input_dim
+        norm_type = str(normalization).lower()
 
         # Construir capas ocultas
         for hidden_dim in hidden_dims:
             layers.append(nn.Linear(prev_dim, hidden_dim))
-            # No usar normalización con batch_size=1 en streaming
+            if norm_type == "layernorm":
+                layers.append(nn.LayerNorm(hidden_dim))
+            elif norm_type == "batchnorm":
+                layers.append(SafeBatchNorm1d(hidden_dim))
             layers.append(nn.ReLU())
             layers.append(nn.Dropout(dropout))
             prev_dim = hidden_dim
@@ -292,9 +318,100 @@ class MLP_MultiLabel(nn.Module):
         return logits
 
 
+
 #%%
 # ==========================
-# 5. Modelo CNN Multi-Label
+# 4b. Modelo CNN Multi-Label
+# ==========================
+class CNN_MultiLabel(nn.Module):
+    """
+    1D CNN para clasificación multi-label secuencial.
+    """
+    def __init__(self, input_dim, hidden_dim, output_dim,
+                 num_layers=2, dropout=0.3, bidirectional=False, normalization="none"):
+        super().__init__()
+        layers = []
+        in_channels = input_dim
+        norm_type = str(normalization).lower()
+        
+        for i in range(num_layers):
+            layers.append(nn.Conv1d(in_channels, hidden_dim, kernel_size=3, padding=1))
+            if norm_type == "layernorm":
+                layers.append(nn.GroupNorm(1, hidden_dim)) # GroupNorm(1) is equivalent to LayerNorm over channels
+            elif norm_type == "batchnorm":
+                layers.append(SafeBatchNorm1d(hidden_dim))
+            layers.append(nn.ReLU())
+            if dropout > 0:
+                layers.append(nn.Dropout(dropout))
+            in_channels = hidden_dim
+            
+        self.conv = nn.Sequential(*layers)
+        self.fc = nn.Linear(hidden_dim, output_dim)
+        
+    def forward(self, x):
+        # x is (batch, seq, features)
+        if x.dim() == 2:
+            x = x.unsqueeze(1) # sequence of length 1 if no history
+        # Conv1d expects (batch, channels, seq)
+        x = x.transpose(1, 2)
+        out = self.conv(x)
+        # Max pooling global a lo largo de la secuencia
+        out = torch.max(out, dim=2)[0]
+        logits = self.fc(out)
+        return logits
+
+
+#%%
+# =================================
+# 4c. Modelo Transformer Multi-Label
+# =================================
+class Transformer_MultiLabel(nn.Module):
+    """
+    Transformer Encoder para clasificación multi-label secuencial.
+    """
+    def __init__(self, input_dim, hidden_dim, output_dim,
+                 num_layers=2, dropout=0.3, bidirectional=False, normalization="layernorm"):
+        super().__init__()
+        self.proj = nn.Linear(input_dim, hidden_dim)
+        norm_type = str(normalization).lower()
+        
+        if norm_type == "batchnorm":
+            self.norm = SafeBatchNorm1d(hidden_dim)
+        elif norm_type == "layernorm":
+            self.norm = nn.LayerNorm(hidden_dim)
+        else:
+            self.norm = nn.Identity()
+        
+        # Ajustar nhead para que hidden_dim sea divisible por nhead
+        nhead = 4
+        while hidden_dim % nhead != 0 and nhead > 1:
+             nhead -= 1
+             
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=hidden_dim, nhead=nhead, dim_feedforward=hidden_dim*2, 
+            dropout=dropout, batch_first=True, norm_first=True
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        self.fc = nn.Linear(hidden_dim, output_dim)
+        
+    def forward(self, x):
+        # x is (batch, seq, features)
+        if x.dim() == 2:
+            x = x.unsqueeze(1)
+            
+        x = self.proj(x)
+        out = self.transformer(x)
+        # Mean pooling a lo largo de la secuencia
+        out = out.mean(dim=1)
+        # Apply extra normalization if requested
+        out = self.norm(out)
+        logits = self.fc(out)
+        return logits
+
+
+#%%
+# ==========================
+# 5. Modelo LSTM Multi-Label para ALPI
 # ==========================
 class AlpiEmbeddingLSTM(nn.Module):
     """

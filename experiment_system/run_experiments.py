@@ -38,31 +38,32 @@ def load_config(path: str) -> dict:
 
 def build_grid(cfg: dict) -> list[dict]:
     """
-    Generate the full cartesian product of model parameters × loss configs.
-
-    Config schema:
-      model:          # dict of lists — all combinations taken
-        past_history: [1, 2, 5]
-        ...
-      loss:           # list of dicts — each is a separate loss config
-        - type: BCE
-        - type: FullAdaptive
-          ...
+    Generate the cartesian product of model parameters × loss configs.
+    Supports defining `model` as a list of dicts to avoid illogical combinations
+    (e.g., bidirectional=True for MLP).
     """
-    model_grid = cfg.get("model", {})
+    model_cfg_raw = cfg.get("model", {})
+    if isinstance(model_cfg_raw, dict):
+        models_configs = [model_cfg_raw]
+    elif isinstance(model_cfg_raw, list):
+        models_configs = model_cfg_raw
+    else:
+        models_configs = []
+
     loss_list  = cfg.get("loss", [{"type": "BCE"}])
 
-    # Cartesian product of model params
-    keys   = list(model_grid.keys())
-    values = [model_grid[k] if isinstance(model_grid[k], list) else [model_grid[k]]
-              for k in keys]
-
     experiments = []
-    for combo in itertools.product(*values):
-        model_cfg = dict(zip(keys, combo))
-        for loss_cfg in loss_list:
-            exp = {**model_cfg, "loss": loss_cfg}
-            experiments.append(exp)
+    
+    for model_grid in models_configs:
+        keys   = list(model_grid.keys())
+        values = [model_grid[k] if isinstance(model_grid[k], list) else [model_grid[k]]
+                  for k in keys]
+        
+        for combo in itertools.product(*values):
+            model_cfg = dict(zip(keys, combo))
+            for loss_cfg in loss_list:
+                exp = {**model_cfg, "loss": loss_cfg}
+                experiments.append(exp)
 
     return experiments
 

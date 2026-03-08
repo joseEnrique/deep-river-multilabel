@@ -8,18 +8,62 @@
 dataset: ai4i          # sobrescribir en cada sección del grid si se quiere nps
 
 model:
-  architecture:  [LSTM]            # LSTM | MLP
-  dataset:       [ai4i, nps]       # ai4i | nps
-  optimizer:     [adam]            # adam | sgd
-  past_history:  [1, 2, 5, 10]    # longitud de secuencia (LSTM)
-  window_size:   [1, 20, 50, 100, 200, 500]
-  hidden_dim:    [32, 64, 128]
-  num_layers:    [1, 2, 3]
-  lr:            [0.01, 0.001, 0.0001]
-  dropout:       [0.3]
-  bidirectional: [false]
-  seed:          [42]
-  epochs:        [1]
+  # ── LSTM
+  - architecture:  [LSTM]
+    dataset:       [ai4i, nps]
+    optimizer:     [adam, sgd]
+    past_history:  [1, 2, 5, 10]
+    window_size:   [1, 20, 50, 100, 200, 500]
+    hidden_dim:    [32, 64, 128]
+    num_layers:    [1, 2]
+    lr:            [0.01, 0.001]
+    dropout:       [0.3]
+    bidirectional: [false, true]
+    normalization: [none, layernorm] # batchnorm fails with batch_size=1, LayerNorm is standard for RNNs
+    seed:          [42]
+    epochs:        [1]
+
+  # ── MLP (no sequence length, bidirectional=False implicitly)
+  - architecture:  [MLP]
+    dataset:       [ai4i, nps]
+    optimizer:     [adam, sgd]
+    past_history:  [1]
+    window_size:   [1, 20, 50, 100, 200, 500]
+    hidden_dim:    [32, 64, 128]
+    num_layers:    [1, 2]
+    lr:            [0.01, 0.001]
+    dropout:       [0.3]
+    normalization: [none, layernorm, batchnorm]
+    seed:          [42]
+    epochs:        [1]
+
+  # ── CNN (needs sequence > 2 usually for kernel=3, depending on padding)
+  - architecture:  [CNN]
+    dataset:       [ai4i, nps]
+    optimizer:     [adam, sgd]
+    past_history:  [2, 5, 10]
+    window_size:   [1, 20, 50, 100, 200, 500]
+    hidden_dim:    [32, 64, 128]
+    num_layers:    [1, 2]
+    lr:            [0.01, 0.001]
+    dropout:       [0.3]
+    normalization: [none, layernorm, batchnorm]
+    seed:          [42]
+    epochs:        [1]
+
+  # ── Transformer (LayerNorm as default internal norm)
+  - architecture:  [Transformer]
+    dataset:       [ai4i, nps]
+    optimizer:     [adam, sgd]
+    past_history:  [2, 5, 10]
+    window_size:   [1, 20, 50, 100, 200, 500]
+    hidden_dim:    [32, 64, 128]
+    num_layers:    [1, 2]
+    lr:            [0.01, 0.001]
+    dropout:       [0.3]
+    normalization: [layernorm]
+    seed:          [42]
+    epochs:        [1]
 
 loss:
   - type: BCE

@@ -63,8 +63,9 @@ def make_exp_name(config: dict) -> str:
     lr        = config.get("lr", "?")
     w         = config.get("window_size", "?")
     opt       = config.get("optimizer", "adam")
+    norm      = config.get("normalization", "none")
     bidir     = "_bidir" if config.get("bidirectional") else ""
-    parts = [arch, dataset, f"ph{ph}", f"h{h}", f"nl{nl}", f"w{w}", f"lr{lr}", opt, loss_type]
+    parts = [arch, dataset, f"ph{ph}", f"h{h}", f"nl{nl}", f"w{w}", f"lr{lr}", opt, norm, loss_type]
     return "".join(str(p) for p in ["_".join(parts), bidir])
 
 
