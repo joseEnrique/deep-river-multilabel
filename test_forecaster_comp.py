@@ -2,7 +2,7 @@ import torch
 import pandas as pd
 import numbers
 import time
-from testclassifier.model import LSTM_MultiLabel, FullAdaptiveFocalLoss
+from testclassifier.model import LSTM_MultiLabel, FullAdaptiveFocalLoss, ImprovedAdaptiveFocalLoss
 from classes.rolling_multilabel_classifier import RollingMultiLabelClassifier
 from classes.rolling_multilabel_classifier_sequences import RollingMultiLabelClassifierSequences
 from datasets.multioutput import Ai4i
@@ -17,13 +17,15 @@ from river import preprocessing
 target_names = ['TWF', 'HDF', 'PWF', 'OSF', 'RNF']
 window_size = 200
 
-def run_experiment(model_type, past_history=1, device_str="cpu"):
-    name = f"{model_type} (past={past_history})" if model_type == "RollingMultiLabelClassifierSequences" else model_type
+def run_experiment(model_type, past_history=1, device_str="cpu", loss_fn=None, loss_name="FullAdaptive"):
+    base_name = f"{model_type} (past={past_history})" if model_type == "RollingMultiLabelClassifierSequences" else model_type
+    name = f"{base_name} [{loss_name}]"
     print(f"\\n▶ STARTING: {name}")
     start_time = time.time()
 
     stream = Ai4i()
-    loss_fn = FullAdaptiveFocalLoss()
+    if loss_fn is None:
+        loss_fn = FullAdaptiveFocalLoss()
 
     if model_type == "RollingMultiLabelClassifier":
         clf = RollingMultiLabelClassifier(
@@ -117,17 +119,26 @@ def run_experiment(model_type, past_history=1, device_str="cpu"):
     return result
 
 
+
 if __name__ == "__main__":
     device_str = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device_str}")
 
     results = []
 
-    res = run_experiment("RollingMultiLabelClassifier", device_str=device_str)
-    results.append(res)
+    loss_functions = [
+        ("BCE",              torch.nn.BCEWithLogitsLoss()),
+        ("FullAdaptive",     FullAdaptiveFocalLoss()),
+        ("ImprovedAdaptive", ImprovedAdaptiveFocalLoss()),
+    ]
 
-    for ph in [1]:
-        res = run_experiment("RollingMultiLabelClassifierSequences", past_history=ph, device_str=device_str)
+    for loss_name, loss_fn in loss_functions:
+        res = run_experiment(
+            "RollingMultiLabelClassifier",
+            device_str=device_str,
+            loss_fn=loss_fn,
+            loss_name=loss_name,
+        )
         results.append(res)
 
     print("\n" + "="*150)
@@ -136,3 +147,4 @@ if __name__ == "__main__":
     df = pd.DataFrame(results)
     print(df.to_string(index=False))
     print("="*150)
+

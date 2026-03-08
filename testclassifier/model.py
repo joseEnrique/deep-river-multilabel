@@ -663,8 +663,103 @@ class FullAdaptiveFocalLoss(nn.Module):
             return loss
 
 # ==========================
+# 9b. ImprovedAdaptiveFocalLoss
+# ==========================
+class ImprovedAdaptiveFocalLoss(nn.Module):
+    """
+    Improved Adaptive Focal Loss.
+
+    Over FullAdaptiveFocalLoss:
+    1. Alpha driven by per-class F1 (not recall alone).
+    2. Gamma driven by per-class F1 (not accuracy, which is ~97% even for bad models).
+    3. Tracks running_fp to compute F1 properly.
+    """
+
+    def __init__(self, base_gamma=2.0, decay=0.999, base_alpha=0.25,
+                 alpha_gain=1.0, gamma_gain=2.0, epsilon=1e-6, reduction='mean'):
+        super().__init__()
+        self.base_gamma = base_gamma
+        self.decay = decay
+        self.base_alpha = base_alpha
+        self.alpha_gain = alpha_gain
+        self.gamma_gain = gamma_gain
+        self.epsilon = epsilon
+        self.reduction = reduction
+        self.register_buffer('running_tp', torch.ones(1))
+        self.register_buffer('running_fp', torch.ones(1))
+        self.register_buffer('running_fn', torch.ones(1))
+        self.register_buffer('running_count', torch.ones(1))
+        self.num_classes = None
+
+    def _init_buffers(self, n_classes, device):
+        self.num_classes = n_classes
+        self.running_tp = torch.ones(n_classes, device=device)
+        self.running_fp = torch.ones(n_classes, device=device)
+        self.running_fn = torch.ones(n_classes, device=device)
+        self.running_count = torch.ones(n_classes, device=device)
+
+    def _ensure_device(self, device):
+        if self.running_tp.device != device:
+            self.running_tp = self.running_tp.to(device)
+            self.running_fp = self.running_fp.to(device)
+            self.running_fn = self.running_fn.to(device)
+            self.running_count = self.running_count.to(device)
+
+    def _update_stats(self, logits, targets):
+        if self.num_classes is None:
+            self._init_buffers(targets.shape[1], targets.device)
+        self._ensure_device(targets.device)
+        preds = (torch.sigmoid(logits) > 0.5).float()
+        d = self.decay
+        self.running_tp = d * self.running_tp + (1 - d) * (preds * targets).sum(dim=0)
+        self.running_fp = d * self.running_fp + (1 - d) * (preds * (1 - targets)).sum(dim=0)
+        self.running_fn = d * self.running_fn + (1 - d) * ((1 - preds) * targets).sum(dim=0)
+        self.running_count = d * self.running_count + (1 - d) * targets.shape[0]
+
+    def _f1(self):
+        num = 2 * self.running_tp
+        den = num + self.running_fp + self.running_fn + self.epsilon
+        return num / den
+
+    def get_logs(self):
+        with torch.no_grad():
+            f1 = self._f1()
+            alpha = torch.clamp(self.base_alpha * (1 + (1 - f1) * self.alpha_gain), max=0.9)
+            gamma = self.base_gamma + (1 - f1) * self.gamma_gain
+            return {"mean_f1": f1.mean().item(), "mean_alpha": alpha.mean().item(),
+                    "mean_gamma": gamma.mean().item(), "max_gamma": gamma.max().item()}
+
+    def forward(self, logits, targets):
+        if self.num_classes is None:
+            self._init_buffers(targets.shape[1], targets.device)
+        self._ensure_device(targets.device)
+        if self.training:
+            with torch.no_grad():
+                self._update_stats(logits, targets)
+
+        f1 = self._f1()
+        alpha = torch.clamp(self.base_alpha * (1.0 + (1.0 - f1) * self.alpha_gain), max=0.9)
+        gamma = self.base_gamma + (1.0 - f1) * self.gamma_gain
+
+        probs = torch.sigmoid(logits)
+        p_t = probs * targets + (1 - probs) * (1 - targets)
+        alpha_t = alpha * targets + (1 - alpha) * (1 - targets)
+        focal_term = (1 - p_t) ** gamma.unsqueeze(0)
+        bce_loss = F.binary_cross_entropy_with_logits(logits, targets, reduction='none')
+        loss = alpha_t * focal_term * bce_loss
+
+        if self.reduction == 'mean':
+            return loss.mean()
+        elif self.reduction == 'sum':
+            return loss.sum()
+        else:
+            return loss
+
+# ==========================
 # 10. AlpiEmbeddingCNN (1D CNN for Alarm Sequences)
 # ==========================
+
+
 class AlpiEmbeddingMLP(nn.Module):
     """
     MLP que usa Global Average Pooling sobre la secuencia de embeddings.
