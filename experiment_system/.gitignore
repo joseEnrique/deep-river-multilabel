@@ -1,0 +1,7 @@
+# Bases de datos SQLite de estado (se regeneran automáticamente)
+*.db
+
+# Resultados de experimentos (carpeta grande, opcional excluir)
+# Comenta estas líneas si quieres versionar los CSVs de resultados
+# results/
+# results_test/

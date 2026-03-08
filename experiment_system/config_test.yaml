@@ -1,0 +1,22 @@
+# Minimal config for smoke testing — 1 experiment only
+dataset: ai4i
+
+model:
+  past_history: [1,2,3]
+  window_size: [200]
+  hidden_dim: [128]
+  num_layers: [2]
+  lr: [1e-3]
+  dropout: [0.3]
+  bidirectional: [false]
+  output_dim: [5]
+  seed: [42]
+  epochs: [1]
+
+loss:
+  - type: BCE
+
+checkpoint_every: 500
+results_dir: results_test
+db_path: experiments_test.db
+final_results_file: results_test/final_results.csv

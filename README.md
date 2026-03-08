@@ -30,14 +30,14 @@ An online multi-label classifier that uses an LSTM network with **Experience Rep
 | `append_predict` | `bool` | `False` | Whether to include the prediction step's sample in the window |
 | `thresholds` | `Dict[str, float]` | `0.5` for all | Per-label decision thresholds |
 | `epochs` | `int` | `1` | Number of gradient steps per sample |
-| `loss_fn` | `Callable` | `None` | Custom loss function (e.g. `FullAdaptiveFocalLoss()`) |
+| `loss_fn` | `Callable` | `None` | Custom loss function (e.g. `AdaptiveFocalLoss()`) |
 | `**kwargs` | | | Extra arguments forwarded to the module (e.g. `hidden_dim`, `num_layers`, `dropout`) |
 
 #### Example
 
 ```python
 from classes.rolling_multilabel_classifier import RollingMultiLabelClassifier
-from testclassifier.model import LSTM_MultiLabel, FullAdaptiveFocalLoss
+from testclassifier.model import LSTM_MultiLabel, AdaptiveFocalLoss
 
 clf = RollingMultiLabelClassifier(
     module=LSTM_MultiLabel,
@@ -52,7 +52,7 @@ clf = RollingMultiLabelClassifier(
     output_dim=5,
     seed=42,
     epochs=1,
-    loss_fn=FullAdaptiveFocalLoss()
+    loss_fn=AdaptiveFocalLoss()
 )
 ```
 
@@ -84,14 +84,14 @@ An online multi-label classifier that extends the rolling window approach to sup
 | `seed` | `int` | `42` | Random seed |
 | `epochs` | `int` | `1` | Number of gradient steps per sample |
 | `threshold` | `float` | `0.5` | Global decision threshold for all labels |
-| `loss_fn` | `Callable` | `None` | Custom loss function (e.g. `FullAdaptiveFocalLoss()`) |
+| `loss_fn` | `Callable` | `None` | Custom loss function (e.g. `AdaptiveFocalLoss()`) |
 | `**kwargs` | | | Extra arguments forwarded to the module (e.g. `hidden_dim`, `num_layers`, `dropout`) |
 
 #### Example
 
 ```python
 from classes.rolling_multilabel_classifier_sequences import RollingMultiLabelClassifierSequences
-from testclassifier.model import LSTM_MultiLabel, FullAdaptiveFocalLoss
+from testclassifier.model import LSTM_MultiLabel, AdaptiveFocalLoss
 
 clf = RollingMultiLabelClassifierSequences(
     module=LSTM_MultiLabel,
@@ -107,7 +107,7 @@ clf = RollingMultiLabelClassifierSequences(
     output_dim=5,
     seed=42,
     epochs=1,
-    loss_fn=FullAdaptiveFocalLoss()
+    loss_fn=AdaptiveFocalLoss()
 )
 ```
 

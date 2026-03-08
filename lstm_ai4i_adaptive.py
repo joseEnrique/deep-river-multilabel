@@ -6,7 +6,7 @@ import numbers
 import os
 import time
 from datetime import datetime
-from testclassifier.model import LSTM_MultiLabel, FocalLoss, AdaptiveWeightedFocalLoss, FullAdaptiveFocalLoss, BidirectionalAdaptiveFocalLoss
+from testclassifier.model import LSTM_MultiLabel, FocalLoss, AdaptiveWeightedFocalLoss, AdaptiveFocalLoss, BidirectionalAdaptiveFocalLoss
 from classes.rolling_multilabel_classifier import RollingMultiLabelClassifier
 from datasets.multioutput import Ai4i
 import evaluate
@@ -78,7 +78,7 @@ def run_single_experiment(args):
         loss_fn = FocalLoss(alpha=loss_conf["alpha"], gamma=loss_conf["gamma"])
         task_id = f"{config['name']} | Static A={loss_conf['alpha']} G={loss_conf['gamma']}"
     elif loss_type == "FullAdaptive":
-        loss_fn = FullAdaptiveFocalLoss(
+        loss_fn = AdaptiveFocalLoss(
             base_gamma=loss_conf["gamma"], 
             base_alpha=loss_conf.get("base_alpha", 0.25), 
             decay=loss_conf["decay"],

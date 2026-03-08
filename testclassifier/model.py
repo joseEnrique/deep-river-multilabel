@@ -531,145 +531,16 @@ class AdaptiveWeightedFocalLoss(nn.Module):
             return loss.sum()
         else:
             return loss
-class FullAdaptiveFocalLoss(nn.Module):
-    """
-    Full Adaptive Focal Loss: Adapts both Alpha and Gamma.
-    
-    1. Alpha Adaptation (Focus Boost):
-       Increases weight for classes with Low Recall (Missed Positives).
-       alpha_t = base_alpha * (1 + (1 - Recall_t))
-       
-    2. Gamma Adaptation (Hardness Focus):
-       Increases focusing parameter for classes with Low Accuracy (Hard Classes).
-       gamma_t = base_gamma + (1 - Accuracy_t) * 2.0
-       
-       If a class is easy (Acc=1.0), gamma stays at base_gamma.
-       If a class is hard (Acc=0.0), gamma increases to (base + 2.0).
-    """
-    def __init__(self, base_gamma=2.0, decay=0.999, base_alpha=0.25, alpha_gain=1.0, gamma_gain=2.0, epsilon=1e-6, reduction='mean'):
-        super().__init__()
-        self.base_gamma = base_gamma
-        self.decay = decay
-        self.base_alpha = base_alpha
-        self.alpha_gain = alpha_gain
-        self.gamma_gain = gamma_gain
-        self.epsilon = epsilon
-        self.reduction = reduction
-        
-        # Stats for Recall (TP, FN) and Accuracy (TP+TN, Total)
-        self.register_buffer('running_tp', torch.ones(1)) 
-        self.register_buffer('running_fn', torch.ones(1))
-        self.register_buffer('running_correct', torch.ones(1))
-        self.register_buffer('running_count', torch.ones(1))
-        
-        self.num_classes = None
-
-    def _update_stats(self, logits, targets):
-        if self.num_classes is None:
-            self.num_classes = targets.shape[1]
-            self.running_tp = torch.ones(self.num_classes, device=targets.device)
-            self.running_fn = torch.ones(self.num_classes, device=targets.device)
-            self.running_correct = torch.ones(self.num_classes, device=targets.device)
-            self.running_count = torch.ones(self.num_classes, device=targets.device)
-            
-        if self.running_tp.device != targets.device:
-            self.running_tp = self.running_tp.to(targets.device)
-            self.running_fn = self.running_fn.to(targets.device)
-            self.running_correct = self.running_correct.to(targets.device)
-            self.running_count = self.running_count.to(targets.device)
-            
-        # Predictions
-        preds = (torch.sigmoid(logits) > 0.5).float()
-        
-        # Recall Stats
-        batch_tp = (preds * targets).sum(dim=0)
-        batch_fn = ((1 - preds) * targets).sum(dim=0)
-        
-        # Accuracy Stats
-        # Correct = (Pred == Target)
-        batch_correct = (preds == targets).float().sum(dim=0)
-        batch_count = targets.shape[0] # Broad cast later or just scalar addition if same for all? 
-        # Actually batch_count is scalar, but we track per class so adding scalar is fine.
-        
-        # Update EMAs
-        self.running_tp = self.decay * self.running_tp + (1 - self.decay) * batch_tp
-        self.running_fn = self.decay * self.running_fn + (1 - self.decay) * batch_fn
-        self.running_correct = self.decay * self.running_correct + (1 - self.decay) * batch_correct
-        self.running_count = self.decay * self.running_count + (1 - self.decay) * batch_count
-
-    def get_logs(self):
-        with torch.no_grad():
-            # Alpha
-            recall = self.running_tp / (self.running_tp + self.running_fn + self.epsilon)
-            alpha_boost = 1.0 + (1.0 - recall) * self.alpha_gain
-            alpha = self.base_alpha * alpha_boost
-            alpha = torch.clamp(alpha, max=0.9)
-            
-            # Gamma
-            accuracy = self.running_correct / (self.running_count + self.epsilon)
-            gamma_boost = (1.0 - accuracy) * self.gamma_gain
-            gamma = self.base_gamma + gamma_boost
-            
-            return {
-                "mean_alpha": alpha.mean().item(),
-                "mean_gamma": gamma.mean().item(),
-                "max_gamma": gamma.max().item()
-            }
-
-    def forward(self, logits, targets):
-        if self.training:
-            with torch.no_grad():
-                self._update_stats(logits, targets)
-        
-        # --- 1. Alpha Adaptation (Recall) ---
-        recall = self.running_tp / (self.running_tp + self.running_fn + self.epsilon)
-        alpha_boost = 1.0 + (1.0 - recall) * self.alpha_gain
-        alpha = self.base_alpha * alpha_boost
-        # Clamp alpha
-        alpha = torch.clamp(alpha, max=0.9)
-        
-        # --- 2. Gamma Adaptation (Accuracy) ---
-        accuracy = self.running_correct / (self.running_count + self.epsilon)
-        # Low Accuracy -> Increase Gamma
-        # Boost up to base + gamma_gain
-        gamma_boost = (1.0 - accuracy) * self.gamma_gain
-        gamma = self.base_gamma + gamma_boost
-        
-        # --- Loss Calculation ---
-        probs = torch.sigmoid(logits)
-        p_t = probs * targets + (1 - probs) * (1 - targets)
-        
-        # Alpha Term
-        # If target=1, alpha_t = alpha
-        # If target=0, alpha_t = 1 - alpha
-        alpha_t = alpha * targets + (1 - alpha) * (1 - targets)
-        
-        # Focal Term: (1 - p_t)^gamma
-        # Note: gamma is a tensor of shape (num_classes,)
-        # p_t is (batch, num_classes)
-        # We need to broadcast gamma
-        gamma_broadcast = gamma.unsqueeze(0) # (1, num_classes)
-        focal_term = (1 - p_t) ** gamma_broadcast
-        
-        bce_loss = F.binary_cross_entropy_with_logits(logits, targets, reduction='none')
-        
-        loss = alpha_t * focal_term * bce_loss
-        
-        if self.reduction == 'mean':
-            return loss.mean()
-        elif self.reduction == 'sum':
-            return loss.sum()
-        else:
-            return loss
 
 # ==========================
-# 9b. ImprovedAdaptiveFocalLoss
+# 9. AdaptiveFocalLoss
 # ==========================
-class ImprovedAdaptiveFocalLoss(nn.Module):
+class AdaptiveFocalLoss(nn.Module):
+
     """
     Improved Adaptive Focal Loss.
 
-    Over FullAdaptiveFocalLoss:
+    
     1. Alpha driven by per-class F1 (not recall alone).
     2. Gamma driven by per-class F1 (not accuracy, which is ~97% even for bad models).
     3. Tracks running_fp to compute F1 properly.
@@ -1131,3 +1002,4 @@ class RobustFocalLoss(nn.Module):
         else:
             return loss
 
+AdaptiveFocalLoss = AdaptiveFocalLoss  # alias

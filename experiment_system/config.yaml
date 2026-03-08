@@ -1,0 +1,41 @@
+# Configuración principal del grid de experimentos
+# Producto cartesiano de model × loss
+#
+# Total ejemplo:
+#   2 arch × 3 h × 3 nl × 6 w × 3 lr × 2 opt × 4 ph × 2 datasets × 4 losses
+#   ≈ 10,368 combinaciones  (filtrar según sea necesario)
+
+dataset: ai4i          # sobrescribir en cada sección del grid si se quiere nps
+
+model:
+  architecture:  [LSTM]            # LSTM | MLP
+  dataset:       [ai4i, nps]       # ai4i | nps
+  optimizer:     [adam]            # adam | sgd
+  past_history:  [1, 2, 5, 10]    # longitud de secuencia (LSTM)
+  window_size:   [1, 20, 50, 100, 200, 500]
+  hidden_dim:    [32, 64, 128]
+  num_layers:    [1, 2, 3]
+  lr:            [0.01, 0.001, 0.0001]
+  dropout:       [0.3]
+  bidirectional: [false]
+  seed:          [42]
+  epochs:        [1]
+
+loss:
+  - type: BCE
+
+  - type: StaticFocal
+    alpha: 0.25
+    gamma: 2.0
+
+  - type: AdaptiveFocal
+    base_gamma: 2.0
+    base_alpha: 0.25
+    decay: 0.999
+    alpha_gain: 1.0
+    gamma_gain: 2.0
+
+checkpoint_every: 500
+results_dir: results
+db_path: experiments.db
+final_results_file: results/final_results.csv

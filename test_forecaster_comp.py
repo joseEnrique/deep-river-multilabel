@@ -2,7 +2,7 @@ import torch
 import pandas as pd
 import numbers
 import time
-from testclassifier.model import LSTM_MultiLabel, FullAdaptiveFocalLoss, ImprovedAdaptiveFocalLoss
+from testclassifier.model import LSTM_MultiLabel, AdaptiveFocalLoss
 from classes.rolling_multilabel_classifier import RollingMultiLabelClassifier
 from classes.rolling_multilabel_classifier_sequences import RollingMultiLabelClassifierSequences
 from datasets.multioutput import Ai4i
@@ -17,7 +17,7 @@ from river import preprocessing
 target_names = ['TWF', 'HDF', 'PWF', 'OSF', 'RNF']
 window_size = 200
 
-def run_experiment(model_type, past_history=1, device_str="cpu", loss_fn=None, loss_name="FullAdaptive"):
+def run_experiment(model_type, past_history=1, device_str="cpu", loss_fn=None, loss_name="AdaptiveFocal"):
     base_name = f"{model_type} (past={past_history})" if model_type == "RollingMultiLabelClassifierSequences" else model_type
     name = f"{base_name} [{loss_name}]"
     print(f"\\n▶ STARTING: {name}")
@@ -25,7 +25,7 @@ def run_experiment(model_type, past_history=1, device_str="cpu", loss_fn=None, l
 
     stream = Ai4i()
     if loss_fn is None:
-        loss_fn = FullAdaptiveFocalLoss()
+        loss_fn = AdaptiveFocalLoss()  
 
     if model_type == "RollingMultiLabelClassifier":
         clf = RollingMultiLabelClassifier(
@@ -128,8 +128,7 @@ if __name__ == "__main__":
 
     loss_functions = [
         ("BCE",              torch.nn.BCEWithLogitsLoss()),
-        ("FullAdaptive",     FullAdaptiveFocalLoss()),
-        ("ImprovedAdaptive", ImprovedAdaptiveFocalLoss()),
+        ("AdaptiveFocal", AdaptiveFocalLoss()),
     ]
 
     for loss_name, loss_fn in loss_functions:

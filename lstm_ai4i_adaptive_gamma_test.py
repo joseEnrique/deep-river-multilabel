@@ -6,7 +6,7 @@ import numbers
 import os
 import time
 from datetime import datetime
-from testclassifier.model import LSTM_MultiLabel, FocalLoss, AdaptiveWeightedFocalLoss, FullAdaptiveFocalLoss, BidirectionalAdaptiveFocalLoss
+from testclassifier.model import LSTM_MultiLabel, FocalLoss, AdaptiveWeightedFocalLoss, AdaptiveFocalLoss, BidirectionalAdaptiveFocalLoss
 from classes.rolling_multilabel_classifier import RollingMultiLabelClassifier
 from datasets.multioutput import Ai4i
 import evaluate
