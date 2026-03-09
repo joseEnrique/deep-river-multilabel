@@ -14,8 +14,11 @@ import torch.nn.functional as F
 
 class SafeBatchNorm1d(nn.BatchNorm1d):
     """
-    Prevents ValueError when training with batch_size=1 (common in online learning).
-    Skips batch norm and returns input unchanged for single-element batches during training.
+    Versión segura de BatchNorm1d que previene bloqueos (ValueError) al entrenar con batch_size=1.
+    
+    Esto es extremadamente común en escenarios de aprendizaje online / streaming donde los datos 
+    llegan de uno en uno o en el último batch de un dataset. Si batch_size=1 durante el 
+    entrenamiento, ignora la normalización para evitar colapsar y devuelve la entrada intacta.
     """
     def forward(self, input):
         if self.training and input.size(0) == 1:
@@ -166,12 +169,17 @@ class WeightedFocalLoss(nn.Module):
 # ==========================
 class AdaptiveWeightedBCE(nn.Module):
     """
-    BCE Loss con pesos adaptativos para streaming.
+    Binary Cross Entropy (BCE) Loss with adaptive positive weights for streaming/online learning.
     
-    Mantiene un conteo online de positivos y negativos para ajustar
-    pos_weight dinámicamente.
+    In highly imbalanced streaming datasets, the global class distribution might be unknown 
+    or drift over time. This loss maintains an Exponential Moving Average (EMA) of 
+    positive and negative samples seen so far to dynamically adjust the `pos_weight`.
     
-    pos_weight = n_neg / n_pos
+    Formula:
+    pos_weight = ExponentialMovingAverage(n_neg) / ExponentialMovingAverage(n_pos)
+    
+    This ensures the model pays proportional attention to the minority class as the 
+    data distribution evolves.
     """
     def __init__(self, num_classes=5, decay=0.999, epsilon=1e-6):
         super().__init__()
@@ -216,6 +224,21 @@ class AdaptiveWeightedBCE(nn.Module):
 # 3. Modelo LSTM
 # ==========================
 class LSTM_MultiLabel(nn.Module):
+    """
+    Red LSTM (Long Short-Term Memory) estándar para clasificación Multi-Label secuencial.
+    
+    Este modelo procesa una secuencia temporal de variables ("past_history") y devuelve
+    las predicciones (logits) para múltiples etiquetas binarias de forma independiente.
+    Es el modelo central y de referencia para la evaluación de series temporales.
+    
+    Componentes:
+    - Capa LSTM: Puede configurarse como bidireccional o unidireccional para captar
+      dependencias en el tiempo (hacia adelante y hacia atrás).
+    - Dropout: Se aplica al estado oculto final como regularización para prevenir sobreajuste.
+    - Normalización (opcional): LayerNorm o BatchNorm1d, ayuda a estabilizar la red
+      antes de entrar a la capa de clasificación lineal final.
+    - Linear (fc): Mapea la representación latente a las clases de salida finales.
+    """
     def __init__(self, input_dim, hidden_dim, output_dim,
                  num_layers=2, dropout=0.3, bidirectional=True, normalization="none"):
         super().__init__()
@@ -325,7 +348,19 @@ class MLP_MultiLabel(nn.Module):
 # ==========================
 class CNN_MultiLabel(nn.Module):
     """
-    1D CNN para clasificación multi-label secuencial.
+    Red Neuronal Convolucional (CNN) 1D para clasificación Multi-Label secuencial.
+    
+    Diseñada como una alternativa más rápida que las redes recurrentes (RNNs) para datos secuenciales,
+    este modelo trata la dimensión del tiempo como si fuera una dimensión espacial, aplicando
+    filtros convolucionales locales a través de la ventana de contexto.
+    
+    Componentes:
+    - Capas Conv1d: Extraen patrones temporales y características locales paso a paso.
+    - Normalización (GroupNorm/BatchNorm): Mantiene el flujo de los gradientes estable.
+    - Activaciones ReLU y Dropout para no-linealidad y evitar el over-fitting.
+    - Global Max Pooling: Extrae las características temporales más importantes de toda la 
+      secuencia colapsando el tiempo, lo que proporciona invariabilidad a desplazamientos en el tiempo.
+    - Linear (fc): Capa conectada densamente que mapea el resultado a las etiquetas predichas.
     """
     def __init__(self, input_dim, hidden_dim, output_dim,
                  num_layers=2, dropout=0.3, bidirectional=False, normalization="none"):
@@ -367,7 +402,21 @@ class CNN_MultiLabel(nn.Module):
 # =================================
 class Transformer_MultiLabel(nn.Module):
     """
-    Transformer Encoder para clasificación multi-label secuencial.
+    Arquitectura Transformer Encoder para clasificación Multi-Label secuencial.
+    
+    Utiliza un mecanismo de autoatención (Self-Attention) para valorar la interacción e
+    importancia relativa de todos los pasos temporales simultáneamente, ofreciendo una
+    alternativa a las LSTM que no sufre de cuellos de botella secuenciales.
+    
+    Componentes:
+    - Proyección Lineal (proj): Adapta las dimensiones de las características de entrada 
+      a la dimensionalidad (hidden_dim) esperada por el Transformer interno.
+    - TransformerEncoder: Usa TransformerEncoderLayer nativo de PyTorch, empotrando redes
+      Multi-Head Attention (atención de múltiples cabezas) y redes feed-forward.
+    - Mean Pooling: Promedia los estados de salida a través de todo el segmento temporal
+      para resumir el conocimiento de la secuencia.
+    - Normalización (opcional) y Linear Final (fc): Para mapear esa idea comprimida a
+      las múltiples predicciones binarias de fallo.
     """
     def __init__(self, input_dim, hidden_dim, output_dim,
                  num_layers=2, dropout=0.3, bidirectional=False, normalization="layernorm"):
@@ -653,16 +702,23 @@ class AdaptiveWeightedFocalLoss(nn.Module):
 # 9. AdaptiveFocalLoss
 # ==========================
 class AdaptiveFocalLoss(nn.Module):
-
     """
-    Improved Adaptive Focal Loss.
-
+    Improved Adaptive Focal Loss designed for highly imbalanced streaming datasets.
     
-    1. Alpha driven by per-class F1 (not recall alone).
-    2. Gamma driven by per-class F1 (not accuracy, which is ~97% even for bad models).
-    3. Tracks running_fp to compute F1 properly.
+    Instead of using static Alpha (class weight) and Gamma (focusing parameter), 
+    this loss dynamically adjusts them based on the streaming F1-score of each class.
+    
+    Mechanism:
+    1. Tracks True Positives (TP), False Positives (FP), and False Negatives (FN) using an EMA (Exponential Moving Average).
+    2. Calculates the streaming F1-score for each class.
+    3. Alpha adaptation: If F1 is low, Alpha increases (giving more weight to the class).
+       alpha_t = base_alpha * (1 + (1 - F1) * alpha_gain)
+    4. Gamma adaptation: If F1 is low, Gamma increases (focusing more on hard, misclassified examples).
+       gamma_t = base_gamma + (1 - F1) * gamma_gain
+       
+    This provides a self-tuning mechanism that naturally relaxes as the model improves 
+    its performance on minority classes.
     """
-
     def __init__(self, base_gamma=2.0, decay=0.999, base_alpha=0.25,
                  alpha_gain=1.0, gamma_gain=2.0, epsilon=1e-6, reduction='mean'):
         super().__init__()
@@ -1005,12 +1061,15 @@ class LearnableFocalLoss(nn.Module):
 class RobustFocalLoss(nn.Module):
     """
     Robust Focal Loss: Auto-scales gain based on batch volatility and anchors parameters.
-    Designed to work with High Learning Rates.
+    Designed specifically to remain stable under High Learning Rates in streaming contexts.
     
     Mechanisms:
-    1. Momentum-based Adaptation: Uses momentum instead of simple EMA for smoothness.
-    2. Gain Scaling: If batch statistics oscillate, effective gain is reduced.
-    3. Anchor: Pulls Alpha/Gamma towards baseline (0.25, 2.0) to prevent collapse.
+    1. Momentum-based Adaptation: Uses momentum (velocity) instead of simple EMA for smoother 
+       parameter updates, reducing oscillation.
+    2. Gain Scaling: If batch statistics oscillate wildly, the effective gain is reduced.
+    3. Anchor Regularization: Constantly pulls Alpha and Gamma towards their baseline values 
+       (e.g., Alpha=0.25, Gamma=2.0) by a small `anchor_weight` to prevent parameters from 
+       drifting to extreme values over long data streams.
     """
     def __init__(self, base_gamma=2.0, base_alpha=0.25, 
                  momentum=0.9, 
