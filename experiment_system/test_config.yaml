@@ -1,0 +1,36 @@
+dataset: ai4i
+
+model:
+  # ── Test LSTM
+  - architecture:  [LSTM]
+    optimizer:     [adam]
+    past_history:  [5]
+    window_size:   [50]
+    hidden_dim:    [32]
+    num_layers:    [1]
+    lr:            [0.01]
+    dropout:       [0.2]
+    bidirectional: [false]
+    normalization: ["none"]
+    seed:          [42]
+    epochs:        [2]
+
+  # ── Test MLP
+  - architecture:  [MLP]
+    optimizer:     [adam]
+    past_history:  [5]
+    window_size:   [50]
+    hidden_dims:   [[64, 32]]
+    lr:            [0.01]
+    dropout:       [0.2]
+    normalization: ["none"]
+    seed:          [42]
+    epochs:        [2,10]
+
+loss:
+  - type: BCE
+
+checkpoint_every: 1000
+results_dir: results_test
+db_path: test_experiments.db
+final_results_file: results_test/final_results.csv

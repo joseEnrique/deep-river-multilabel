@@ -181,23 +181,19 @@ def run(exp_id: str, exp_name: str, config: dict, results_dir: Path,
     # ── Loss ─────────────────────────────────────────────────────────────────
     loss_fn = build_loss(loss_cfg)
 
-    # ── Model ─────────────────────────────────────────────────────────────────
+    kwargs_for_clf = {
+        k: v for k, v in model_cfg.items() 
+        if k not in ["dataset", "architecture", "optimizer", "output_dim"]
+    }
+
     clf = RollingMultiLabelClassifierSequences(
         module=module_cls,
         label_names=label_names,
         optimizer_fn=optimizer_fn,
-        lr=model_cfg["lr"],
         device=device_str,
-        window_size=model_cfg["window_size"],
-        past_history=model_cfg["past_history"],
-        hidden_dim=model_cfg["hidden_dim"],
-        num_layers=model_cfg["num_layers"],
-        dropout=model_cfg["dropout"],
-        bidirectional=model_cfg.get("bidirectional", False),
         output_dim=output_dim,
-        seed=model_cfg.get("seed", 42),
-        epochs=model_cfg.get("epochs", 1),
         loss_fn=loss_fn,
+        **kwargs_for_clf
     )
 
     pr = SelectType(numbers.Number) | preprocessing.StandardScaler()

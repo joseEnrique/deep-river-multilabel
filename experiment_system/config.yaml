@@ -7,54 +7,53 @@ model:
   - architecture:  [LSTM]
     optimizer:     [adam, sgd]
     past_history:  [1, 2, 5, 10]
-    window_size:   [1, 20, 50, 100, 200, 500]
+    window_size:   [1, 50, 200]
     hidden_dim:    [32, 64, 128]
     num_layers:    [1, 2, 3]
     lr:            [0.01, 0.001, 0.0001]
-    dropout:       [0.3]
+    dropout:       [0.2, 0]
     bidirectional: [false, true]
-    normalization: [layernorm, batchnorm]
+    normalization: ["none", layernorm, batchnorm]
     seed:          [42]
-    epochs:        [1]
+    epochs:        [1, 5, 10]
 
-  # ── MLP (no sequence length, bidirectional=False implicitly)
+  # ── MLP (flattened sequence, bidirectional=False implicitly)
   - architecture:  [MLP]
     optimizer:     [adam, sgd]
-    past_history:  [1]
-    window_size:   [1, 20, 50, 100, 200, 500]
-    hidden_dim:    [32, 64, 128]
-    num_layers:    [1, 2, 3]
+    past_history:  [1, 2, 5, 10]
+    window_size:   [1, 50, 200]
+    hidden_dims:   [[128, 64, 32], [128, 64], [64, 32], [32, 32, 32], [64, 64, 64], [128, 128, 128]]
     lr:            [0.01, 0.001, 0.0001]
-    dropout:       [0.3]
-    normalization: [layernorm, batchnorm]
+    dropout:       [0.2, 0]
+    normalization: ["none", layernorm, batchnorm]
     seed:          [42]
-    epochs:        [1]
+    epochs:        [1, 5, 10]
 
   # ── CNN
   - architecture:  [CNN]
     optimizer:     [adam, sgd]
     past_history:  [1, 2, 5, 10]
-    window_size:   [1, 20, 50, 100, 200, 500]
+    window_size:   [1, 50, 200]
     hidden_dim:    [32, 64, 128]
     num_layers:    [1, 2, 3]
     lr:            [0.01, 0.001, 0.0001]
-    dropout:       [0.3]
-    normalization: [layernorm, batchnorm]
+    dropout:       [0.2, 0]
+    normalization: ["none", layernorm, batchnorm]
     seed:          [42]
-    epochs:        [1]
+    epochs:        [1, 5, 10]
 
   # ── Transformer
   - architecture:  [Transformer]
     optimizer:     [adam, sgd]
     past_history:  [1, 2, 5, 10]
-    window_size:   [1, 20, 50, 100, 200, 500]
+    window_size:   [1, 50, 200]
     hidden_dim:    [32, 64, 128]
     num_layers:    [1, 2, 3]
     lr:            [0.01, 0.001, 0.0001]
-    dropout:       [0.3]
-    normalization: [layernorm, batchnorm]
+    dropout:       [0.2, 0]
+    normalization: ["none", layernorm, batchnorm]
     seed:          [42]
-    epochs:        [1]
+    epochs:        [1, 5, 10]
 
 loss:
   - type: BCE
@@ -70,7 +69,7 @@ loss:
     alpha_gain: 1.0
     gamma_gain: 2.0
 
-checkpoint_every: 500
+checkpoint_every: 1000
 results_dir: results
 db_path: experiments.db
 final_results_file: results/final_results.csv

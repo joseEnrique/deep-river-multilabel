@@ -58,8 +58,15 @@ def make_exp_name(config: dict) -> str:
     dataset   = config.get("dataset", "ai4i")
     loss_type = config.get("loss", {}).get("type", "?")
     ph        = config.get("past_history", "?")
-    h         = config.get("hidden_dim", "?")
-    nl        = config.get("num_layers", "?")
+    
+    if "hidden_dims" in config:
+        h_dims = config["hidden_dims"]
+        h = "-".join(map(str, h_dims))
+        nl = len(h_dims)
+    else:
+        h         = config.get("hidden_dim", "?")
+        nl        = config.get("num_layers", "?")
+        
     lr        = config.get("lr", "?")
     w         = config.get("window_size", "?")
     opt       = config.get("optimizer", "adam")

@@ -240,7 +240,7 @@ class LSTM_MultiLabel(nn.Module):
     - Linear (fc): Mapea la representación latente a las clases de salida finales.
     """
     def __init__(self, input_dim, hidden_dim, output_dim,
-                 num_layers=2, dropout=0.3, bidirectional=True, normalization="none"):
+                 num_layers=2, dropout=0.3, bidirectional=True, normalization="none", **kwargs):
         super().__init__()
         self.bidirectional = bidirectional
         self.normalization = str(normalization).lower()
@@ -268,8 +268,8 @@ class LSTM_MultiLabel(nn.Module):
             last_hidden = torch.cat((hn[-2], hn[-1]), dim=1)
         else:
             last_hidden = hn[-1]
-        last_hidden = self.dropout(last_hidden)
         last_hidden = self.norm(last_hidden)
+        last_hidden = self.dropout(last_hidden)
         logits = self.fc(last_hidden)
         return logits
 
@@ -292,7 +292,7 @@ class MLP_MultiLabel(nn.Module):
     - Input: 7 features (Air temp, Process temp, Rotational speed, Torque, Tool wear, Type_encoded)
     - Output: 5 labels (TWF, HDF, PWF, OSF, RNF)
     """
-    def __init__(self, input_dim, hidden_dims=[128, 64, 32], output_dim=5, dropout=0.3, normalization="none"):
+    def __init__(self, input_dim, hidden_dims=None, output_dim=5, dropout=0.3, normalization="none", past_history=1, **kwargs):
         """
         Args:
             input_dim: Dimensión de entrada (número de features)
@@ -303,8 +303,13 @@ class MLP_MultiLabel(nn.Module):
         """
         super().__init__()
 
+        if hidden_dims is None:
+            hidden_dim = kwargs.get('hidden_dim', 64)
+            num_layers = kwargs.get('num_layers', 2)
+            hidden_dims = [hidden_dim] * num_layers
+
         layers = []
-        prev_dim = input_dim
+        prev_dim = input_dim * past_history
         norm_type = str(normalization).lower()
 
         # Construir capas ocultas
@@ -315,7 +320,8 @@ class MLP_MultiLabel(nn.Module):
             elif norm_type == "batchnorm":
                 layers.append(SafeBatchNorm1d(hidden_dim))
             layers.append(nn.ReLU())
-            layers.append(nn.Dropout(dropout))
+            if dropout > 0:
+                layers.append(nn.Dropout(dropout))
             prev_dim = hidden_dim
 
         # Capa de salida
@@ -333,9 +339,9 @@ class MLP_MultiLabel(nn.Module):
         Returns:
             logits: Tensor de salida con shape (batch_size, output_dim)
         """
-        # Si viene con dimensión de secuencia (batch, seq, features), tomar el último timestep
+        # Si viene con dimensión de secuencia (batch, seq, features), aplanar la secuencia temporal entera
         if x.dim() == 3:
-            x = x[:, -1, :]  # Tomar último timestep
+            x = x.view(x.size(0), -1)  # Aplanar: (batch, seq * features)
 
         logits = self.network(x)
         return logits
@@ -363,7 +369,7 @@ class CNN_MultiLabel(nn.Module):
     - Linear (fc): Capa conectada densamente que mapea el resultado a las etiquetas predichas.
     """
     def __init__(self, input_dim, hidden_dim, output_dim,
-                 num_layers=2, dropout=0.3, bidirectional=False, normalization="none"):
+                 num_layers=2, dropout=0.3, bidirectional=False, normalization="none", **kwargs):
         super().__init__()
         layers = []
         in_channels = input_dim
@@ -419,7 +425,7 @@ class Transformer_MultiLabel(nn.Module):
       las múltiples predicciones binarias de fallo.
     """
     def __init__(self, input_dim, hidden_dim, output_dim,
-                 num_layers=2, dropout=0.3, bidirectional=False, normalization="layernorm"):
+                 num_layers=2, dropout=0.3, bidirectional=False, normalization="layernorm", **kwargs):
         super().__init__()
         self.proj = nn.Linear(input_dim, hidden_dim)
         norm_type = str(normalization).lower()

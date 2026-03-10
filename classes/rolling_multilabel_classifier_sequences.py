@@ -105,6 +105,7 @@ class RollingMultiLabelClassifierSequences(DeepEstimator, river_base.MultiLabelC
                 for k, v in kwargs.items()
                 if k not in {"n_features", "input_dim"}
             }
+            filtered_kwargs["past_history"] = past_history
             torch.manual_seed(seed)
             # Create temporary module with input_dim=1
             module_instance = module(input_dim=1, **filtered_kwargs)
@@ -170,6 +171,7 @@ class RollingMultiLabelClassifierSequences(DeepEstimator, river_base.MultiLabelC
                 for k, v in self.module_kwargs.items()
                 if k not in {"n_features", "input_dim"}
             }
+            filtered_kwargs["past_history"] = self.past_history
             self.module = self.module_cls(
                 input_dim=n_features,
                 **filtered_kwargs,
