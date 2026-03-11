@@ -320,8 +320,7 @@ class MLP_MultiLabel(nn.Module):
             elif norm_type == "batchnorm":
                 layers.append(SafeBatchNorm1d(hidden_dim))
             layers.append(nn.ReLU())
-            if dropout > 0:
-                layers.append(nn.Dropout(dropout))
+            layers.append(nn.Dropout(dropout))
             prev_dim = hidden_dim
 
         # Capa de salida
@@ -382,8 +381,7 @@ class CNN_MultiLabel(nn.Module):
             elif norm_type == "batchnorm":
                 layers.append(SafeBatchNorm1d(hidden_dim))
             layers.append(nn.ReLU())
-            if dropout > 0:
-                layers.append(nn.Dropout(dropout))
+            layers.append(nn.Dropout(dropout))
             in_channels = hidden_dim
             
         self.conv = nn.Sequential(*layers)
