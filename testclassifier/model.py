@@ -11,6 +11,7 @@ Inspirado en MultiLabelLSTM pero adaptado para One-vs-Rest:
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import math
 
 class SafeBatchNorm1d(nn.BatchNorm1d):
     """
@@ -404,6 +405,20 @@ class CNN_MultiLabel(nn.Module):
 # =================================
 # 4c. Modelo Transformer Multi-Label
 # =================================
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model, max_len=5000):
+        super().__init__()
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        pe = pe.unsqueeze(0)
+        self.register_buffer('pe', pe)
+
+    def forward(self, x):
+        return x + self.pe[:, :x.size(1), :]
+
 class Transformer_MultiLabel(nn.Module):
     """
     Arquitectura Transformer Encoder para clasificación Multi-Label secuencial.
@@ -426,6 +441,7 @@ class Transformer_MultiLabel(nn.Module):
                  num_layers=2, dropout=0.3, bidirectional=False, normalization="layernorm", **kwargs):
         super().__init__()
         self.proj = nn.Linear(input_dim, hidden_dim)
+        self.pos_encoder = PositionalEncoding(hidden_dim)
         norm_type = str(normalization).lower()
         
         if norm_type == "batchnorm":
@@ -453,9 +469,10 @@ class Transformer_MultiLabel(nn.Module):
             x = x.unsqueeze(1)
             
         x = self.proj(x)
+        x = self.pos_encoder(x)
         out = self.transformer(x)
-        # Mean pooling a lo largo de la secuencia
-        out = out.mean(dim=1)
+        # Max pooling a lo largo de la secuencia
+        out = torch.max(out, dim=1)[0]
         # Apply extra normalization if requested
         out = self.norm(out)
         logits = self.fc(out)
