@@ -243,10 +243,12 @@ class AdaptiveFocalLoss(nn.Module):
 
     def _init_buffers(self, n_classes, device):
         self.num_classes = n_classes
-        self.running_tp = torch.ones(n_classes, device=device)
-        self.running_fp = torch.ones(n_classes, device=device)
-        self.running_fn = torch.ones(n_classes, device=device)
-        self.running_count = torch.ones(n_classes, device=device)
+        self.running_tp = torch.zeros(n_classes, device=device)
+        self.running_fp = torch.zeros(n_classes, device=device)
+        self.running_fn = torch.zeros(n_classes, device=device)
+        self.running_count = torch.zeros(1, device=device)
+        self.alpha_track = torch.zeros(n_classes, device=device)
+        self.gamma_track = torch.zeros(n_classes, device=device)
 
     def _ensure_device(self, device):
         if self.running_tp.device != device:
@@ -254,17 +256,24 @@ class AdaptiveFocalLoss(nn.Module):
             self.running_fp = self.running_fp.to(device)
             self.running_fn = self.running_fn.to(device)
             self.running_count = self.running_count.to(device)
+            self.alpha_track = getattr(self, "alpha_track", torch.zeros(self.num_classes, device=device)).to(device)
+            self.gamma_track = getattr(self, "gamma_track", torch.zeros(self.num_classes, device=device)).to(device)
 
     def _update_stats(self, logits, targets):
         if self.num_classes is None:
             self._init_buffers(targets.shape[1], targets.device)
         self._ensure_device(targets.device)
         preds = (torch.sigmoid(logits) > 0.5).float()
-        d = self.decay
+        
+        if self.running_count.item() == 0:
+            d = 0.0
+        else:
+            d = self.decay
+            
         self.running_tp = d * self.running_tp + (1 - d) * (preds * targets).sum(dim=0)
         self.running_fp = d * self.running_fp + (1 - d) * (preds * (1 - targets)).sum(dim=0)
         self.running_fn = d * self.running_fn + (1 - d) * ((1 - preds) * targets).sum(dim=0)
-        self.running_count = d * self.running_count + (1 - d) * targets.shape[0]
+        self.running_count += 1
 
     def _f1(self):
         num = 2 * self.running_tp
@@ -276,8 +285,24 @@ class AdaptiveFocalLoss(nn.Module):
             f1 = self._f1()
             alpha = torch.clamp(self.base_alpha * (1 + (1 - f1) * self.alpha_gain), max=0.9)
             gamma = self.base_gamma + (1 - f1) * self.gamma_gain
-            return {"mean_f1": f1.mean().item(), "mean_alpha": alpha.mean().item(),
-                    "mean_gamma": gamma.mean().item(), "max_gamma": gamma.max().item()}
+            
+            # Store values for individualized queries
+            self.alpha_track = alpha.clone()
+            self.gamma_track = gamma.clone()
+            
+            logs = {
+                "mean_f1":    f1.mean().item(),
+                "mean_alpha": alpha.mean().item(),
+                "mean_gamma": gamma.mean().item(),
+                "max_gamma":  gamma.max().item()
+            }
+            
+            # Add metrics per class
+            for i in range(self.num_classes):
+                logs[f"alpha_c{i}"] = alpha[i].item()
+                logs[f"gamma_c{i}"] = gamma[i].item()
+                
+            return logs
 
     def forward(self, logits, targets):
         if self.num_classes is None:
