@@ -183,7 +183,7 @@ def run(exp_id: str, exp_name: str, config: dict, results_dir: Path,
 
     kwargs_for_clf = {
         k: v for k, v in model_cfg.items() 
-        if k not in ["dataset", "architecture", "optimizer", "output_dim"]
+        if k not in ["dataset", "architecture", "optimizer", "output_dim", "device"]
     }
 
     clf = RollingMultiLabelClassifierSequences(
