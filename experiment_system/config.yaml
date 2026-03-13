@@ -1,59 +1,69 @@
 # Configuración principal del grid de experimentos
+# NOTAS sobre parámetros aparcados para explorar más adelante:
+# - epochs: Por tiempo reducimos a [1] epoch. Antes teníamos 5 y 10.
+# - normalization: Se ha quitado 'batchnorm', dejando solo 'none' y 'layernorm'.
+# - bidirectional: Se ha fijado a [false] en los modelos recurrentes.
+# - window_size: Aspecto importante a explorar. window_size=10 equivale a batch_size=10, lo cual
+#   junto con epochs=1 puede ser insuficiente para aprender bien. Lo mantenemos en [10, 50, 200].
 
 dataset: ai4i
 
 model:
   # ── LSTM
   - architecture:  [LSTM]
-    optimizer:     [adam]
+    device:        ["cuda:0"]
+    optimizer:     [adam, sgd]
     past_history:  [1, 2,  10]
-    window_size:   [1, 50, 200]
+    window_size:   [10, 50, 200]
     hidden_dim:    [32, 64, 128]
     num_layers:    [1, 2, 3]
-    lr:            [0.01, 0.0001]
+    lr:            [0.01, 0.001, 0.0001]
     dropout:       [0.2, 0]
-    bidirectional: [false, true]
-    normalization: ["none", layernorm, batchnorm]
+    bidirectional: [false]
+    normalization: ["none", "layernorm"]
     seed:          [42]
-    epochs:        [1, 5]
+    epochs:        [1]
 
   # ── MLP (flattened sequence, bidirectional=False implicitly)
   - architecture:  [MLP]
-    optimizer:     [adam]
+    device:        ["cuda:0"]
+    optimizer:     [adam, sgd]
     past_history:  [1, 2, 10]
-    window_size:   [1, 50, 200]
+    window_size:   [10, 50, 200]
     hidden_dims:   [[128, 64, 32], [128, 64], [64, 32], [32, 32, 32], [64, 64, 64], [128, 128, 128]]
-    lr:            [0.01, 0.0001]
+    lr:            [0.01, 0.001, 0.0001]
     dropout:       [0.2, 0]
-    normalization: ["none", layernorm, batchnorm]
+    normalization: ["none", "layernorm"]
     seed:          [42]
-    epochs:        [1, 5]
+    epochs:        [1]
 
   # ── CNN
   - architecture:  [CNN]
-    optimizer:     [adam]
+    device:        ["cuda:1"]
+    optimizer:     [adam, sgd]
     past_history:  [1, 2, 10]
-    window_size:   [1, 50, 200]
+    window_size:   [10, 50, 200]
     hidden_dim:    [32, 64, 128]
     num_layers:    [1, 2, 3]
-    lr:            [0.01, 0.0001]
+    lr:            [0.01, 0.001, 0.0001]
     dropout:       [0.2, 0]
-    normalization: ["none", layernorm, batchnorm]
+    normalization: ["none", "layernorm"]
     seed:          [42]
-    epochs:        [1, 5]
+    epochs:        [1]
 
   # ── Transformer
   - architecture:  [Transformer]
-    optimizer:     [adam]
+    device:        ["cuda:1"]
+    optimizer:     [adam, sgd]
     past_history:  [1, 2,  10]
-    window_size:   [1, 50, 200]
+    window_size:   [10, 50, 200]
     hidden_dim:    [32, 64, 128]
     num_layers:    [1, 2, 3]
-    lr:            [0.01, 0.0001]
+    lr:            [0.01, 0.001, 0.0001]
     dropout:       [0.2, 0]
-    normalization: ["none", layernorm, batchnorm]
+    normalization: ["none", "layernorm"]
     seed:          [42]
-    epochs:        [1, 5]
+    epochs:        [1]
 
 loss:
   - type: BCE

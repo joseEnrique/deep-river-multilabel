@@ -103,9 +103,9 @@ def main():
     if args.status:
         return
 
-    # Device
-    device_str = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"Device: {device_str}\n")
+    # Device baseline (overridden by config if specified)
+    default_device_str = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"Default Device: {default_device_str}\n")
 
     # ── Run pending experiments ────────────────────────────────────────────
     pending = db.get_pending(db_path)
@@ -119,6 +119,9 @@ def main():
 
         db.claim(exp_id, db_path)
 
+        # Extract device from config or fallback to default
+        current_device_str = exp_cfg.get("device", default_device_str)
+
         try:
             result = runner.run(
                 exp_id=exp_id,
@@ -126,7 +129,7 @@ def main():
                 config=exp_cfg,
                 results_dir=res_dir,
                 checkpoint_every=ckpt_every,
-                device_str=device_str,
+                device_str=current_device_str,
             )
             db.mark_done(exp_id, result, db_path)
             print(f"  ✅ DONE → MacroF1={result.get('macro_f1', '?')}%  "
