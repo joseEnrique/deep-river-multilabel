@@ -18,6 +18,8 @@ import itertools
 import json
 import sys
 from pathlib import Path
+import concurrent.futures
+import multiprocessing
 
 import torch
 import yaml
@@ -107,19 +109,16 @@ def main():
     default_device_str = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Default Device: {default_device_str}\n")
 
-    # ── Run pending experiments ────────────────────────────────────────────
-    pending = db.get_pending(db_path)
-    print(f"Experiments to run: {len(pending)}\n")
-
-    for i, (exp_id, exp_name, exp_cfg) in enumerate(pending, 1):
+    # ── Helpers for parallel execution ─────────────────────────────────────
+    def run_single_experiment(worker_args):
+        i, (exp_id, exp_name, exp_cfg) = worker_args
         loss_type = exp_cfg.get("loss", {}).get("type", "?")
-        print(f"\n{'#'*60}")
-        print(f"[{i}/{len(pending)}] {exp_name}")
-        print(f"{'#'*60}")
+        
+        # We don't print massive banners here to avoid messy console output, 
+        # but you can log the start.
+        print(f"[{i}/{len(pending)}] STARTED: {exp_name} on {exp_cfg.get('device', default_device_str)}")
 
         db.claim(exp_id, db_path)
-
-        # Extract device from config or fallback to default
         current_device_str = exp_cfg.get("device", default_device_str)
 
         try:
@@ -132,21 +131,52 @@ def main():
                 device_str=current_device_str,
             )
             db.mark_done(exp_id, result, db_path)
-            print(f"  ✅ DONE → MacroF1={result.get('macro_f1', '?')}%  "
-                  f"MicroF1={result.get('micro_f1', '?')}%  "
+            print(f"[{i}/{len(pending)}] ✅ DONE → {exp_name} | MacroF1={result.get('macro_f1', '?')}% "
                   f"({result.get('duration_s', '?')}s)")
+            return True
 
         except KeyboardInterrupt:
-            print(f"\n⚠️  Interrupted during {exp_id}. Marking as failed so it retries next run.")
+            # En procesos paralelos el KeyboardInterrupt es delicado, pero marcamos como fallido
             db.mark_failed(exp_id, "KeyboardInterrupt", db_path)
-            raise  # propagate so the process exits cleanly
+            return False
 
         except Exception as e:
             import traceback
             tb = traceback.format_exc()
-            print(f"  ❌ FAILED: {e}")
-            print(tb)
+            print(f"[{i}/{len(pending)}] ❌ FAILED: {exp_name} -> {e}")
             db.mark_failed(exp_id, f"{e}\n{tb[:1500]}", db_path)
+            return False
+
+    # ── Run pending experiments (PARALLEL) ─────────────────────────────────
+    pending = db.get_pending(db_path)
+    print(f"Experiments to run: {len(pending)}\n")
+    
+    # We calculate how many workers to use. You can tweak this.
+    # A good default is trying to launch 1-2 workers per available GPU max.
+    # But for a hardcoded max, let's use a conservative number.
+    max_workers = min(len(pending), 6) # Up to 6 simultaneous experiments
+    print(f"Launching ProcessPool with {max_workers} parallel workers...\n")
+
+    # Prepare arguments for the workers
+    worker_tasks = [(i, exp) for i, exp in enumerate(pending, 1)]
+
+    # Use robust start method for PyTorch multiprocessing
+    try:
+        multiprocessing.set_start_method('spawn')
+    except RuntimeError:
+        pass # Already set
+
+    try:
+        with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
+            # We don't strictly need to wait for `.result()` unless we want to handle exceptions 
+            # in the main thread, but it's good to consume the iterator so the main thread blocks.
+            for _ in executor.map(run_single_experiment, worker_tasks):
+                pass
+    except KeyboardInterrupt:
+        print("\n\n⚠️ Global KeyboardInterrupt detected! Shutting down workers...")
+        # Note: Executor shutdown takes care of child processes in standard Python, 
+        # but PyTorch processes might need forced killing in extreme cases.
+        sys.exit(1)
 
     # ── Export final results ───────────────────────────────────────────────
     print(f"\n{'='*60}")
