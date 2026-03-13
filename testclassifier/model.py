@@ -13,6 +13,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 
+from testclassifier.loss import (
+    FocalLoss, WeightedFocalLoss, AdaptiveWeightedBCE,
+    AdaptiveWeightedFocalLoss, AdaptiveFocalLoss, BidirectionalAdaptiveFocalLoss,
+    LearnableFocalLoss, RobustFocalLoss
+)
+
 class SafeBatchNorm1d(nn.BatchNorm1d):
     """
     Versión segura de BatchNorm1d que previene bloqueos (ValueError) al entrenar con batch_size=1.
@@ -980,5 +986,3 @@ class RobustFocalLoss(nn.Module):
             return loss.sum()
         else:
             return loss
-
-AdaptiveFocalLoss = AdaptiveFocalLoss  # alias

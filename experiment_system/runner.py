@@ -30,9 +30,9 @@ from datasets.multioutput import Ai4i
 from datasets.multioutput.nps import NPS
 from classes.rolling_multilabel_classifier_sequences import RollingMultiLabelClassifierSequences
 from testclassifier.model import (
-    LSTM_MultiLabel, MLP_MultiLabel, CNN_MultiLabel, Transformer_MultiLabel,
-    FocalLoss, AdaptiveFocalLoss,
+    LSTM_MultiLabel, MLP_MultiLabel, CNN_MultiLabel, Transformer_MultiLabel
 )
+from testclassifier.loss import FocalLoss, AdaptiveFocalLoss
 import evaluate as _evaluate
 from metrics import HammingLoss, ExampleF1, ExamplePrecision, ExampleRecall
 
