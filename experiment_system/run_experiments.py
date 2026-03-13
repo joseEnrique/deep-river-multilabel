@@ -109,43 +109,43 @@ def main():
     default_device_str = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Default Device: {default_device_str}\n")
 
-    # ── Helpers for parallel execution ─────────────────────────────────────
-    def run_single_experiment(worker_args):
-        i, (exp_id, exp_name, exp_cfg) = worker_args
-        loss_type = exp_cfg.get("loss", {}).get("type", "?")
-        
-        # We don't print massive banners here to avoid messy console output, 
-        # but you can log the start.
-        print(f"[{i}/{len(pending)}] STARTED: {exp_name} on {exp_cfg.get('device', default_device_str)}")
+# ── Helpers for parallel execution ─────────────────────────────────────────
+def run_single_experiment(worker_args):
+    i, total_pending, exp_id, exp_name, exp_cfg, db_path, res_dir, ckpt_every, default_device_str = worker_args
+    loss_type = exp_cfg.get("loss", {}).get("type", "?")
+    
+    # We don't print massive banners here to avoid messy console output, 
+    # but you can log the start.
+    print(f"[{i}/{total_pending}] STARTED: {exp_name} on {exp_cfg.get('device', default_device_str)}")
 
-        db.claim(exp_id, db_path)
-        current_device_str = exp_cfg.get("device", default_device_str)
+    db.claim(exp_id, db_path)
+    current_device_str = exp_cfg.get("device", default_device_str)
 
-        try:
-            result = runner.run(
-                exp_id=exp_id,
-                exp_name=exp_name,
-                config=exp_cfg,
-                results_dir=res_dir,
-                checkpoint_every=ckpt_every,
-                device_str=current_device_str,
-            )
-            db.mark_done(exp_id, result, db_path)
-            print(f"[{i}/{len(pending)}] ✅ DONE → {exp_name} | MacroF1={result.get('macro_f1', '?')}% "
-                  f"({result.get('duration_s', '?')}s)")
-            return True
+    try:
+        result = runner.run(
+            exp_id=exp_id,
+            exp_name=exp_name,
+            config=exp_cfg,
+            results_dir=res_dir,
+            checkpoint_every=ckpt_every,
+            device_str=current_device_str,
+        )
+        db.mark_done(exp_id, result, db_path)
+        print(f"[{i}/{total_pending}] ✅ DONE → {exp_name} | MacroF1={result.get('macro_f1', '?')}% "
+              f"({result.get('duration_s', '?')}s)")
+        return True
 
-        except KeyboardInterrupt:
-            # En procesos paralelos el KeyboardInterrupt es delicado, pero marcamos como fallido
-            db.mark_failed(exp_id, "KeyboardInterrupt", db_path)
-            return False
+    except KeyboardInterrupt:
+        # En procesos paralelos el KeyboardInterrupt es delicado, pero marcamos como fallido
+        db.mark_failed(exp_id, "KeyboardInterrupt", db_path)
+        return False
 
-        except Exception as e:
-            import traceback
-            tb = traceback.format_exc()
-            print(f"[{i}/{len(pending)}] ❌ FAILED: {exp_name} -> {e}")
-            db.mark_failed(exp_id, f"{e}\n{tb[:1500]}", db_path)
-            return False
+    except Exception as e:
+        import traceback
+        tb = traceback.format_exc()
+        print(f"[{i}/{total_pending}] ❌ FAILED: {exp_name} -> {e}")
+        db.mark_failed(exp_id, f"{e}\n{tb[:1500]}", db_path)
+        return False
 
     # ── Run pending experiments (PARALLEL) ─────────────────────────────────
     pending = db.get_pending(db_path)
@@ -158,7 +158,11 @@ def main():
     print(f"Launching ProcessPool with {max_workers} parallel workers...\n")
 
     # Prepare arguments for the workers
-    worker_tasks = [(i, exp) for i, exp in enumerate(pending, 1)]
+    total_pending = len(pending)
+    worker_tasks = [
+        (i, total_pending, exp_id, exp_name, exp_cfg, db_path, res_dir, ckpt_every, default_device_str) 
+        for i, (exp_id, exp_name, exp_cfg) in enumerate(pending, 1)
+    ]
 
     # Use robust start method for PyTorch multiprocessing
     try:
