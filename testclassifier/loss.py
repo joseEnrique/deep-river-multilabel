@@ -122,9 +122,66 @@ class AdaptiveWeightedBCE(nn.Module):
                 self.pos_weight = torch.clamp(self.pos_weight, min=1.0, max=100.0)
 
         return F.binary_cross_entropy_with_logits(
-            logits, 
-            targets, 
+            logits,
+            targets,
             pos_weight=self.pos_weight
+        )
+
+
+class AdaptiveBCE(nn.Module):
+    """
+    BCE con pos_weight adaptativo por clase — versión con lazy init y decay rápido.
+
+    Corrige dos limitaciones de AdaptiveWeightedBCE: (1) num_classes se infiere del primer
+    batch en lugar de requerirse al init, (2) decay=0.9 por defecto para que la EMA
+    responda rápido en streams cortos (con 0.999 tarda ~1000 muestras en estabilizar).
+
+    Mecanismo: pos_weight = running_neg / running_pos, clamp a [1, max_pos_weight].
+    Sin término focal — mantiene el gradiente completo de BCE.
+    """
+    def __init__(self, decay=0.9, max_pos_weight=100.0, epsilon=1e-6):
+        super().__init__()
+        self.decay = decay
+        self.max_pos_weight = max_pos_weight
+        self.epsilon = epsilon
+        self.register_buffer('running_pos', torch.ones(1))
+        self.register_buffer('running_neg', torch.ones(1))
+        self.register_buffer('pos_weight', torch.ones(1))
+        self.register_buffer('running_count', torch.zeros(1))
+        self.num_classes = None
+
+    def _init_buffers(self, n_classes, device):
+        self.num_classes = n_classes
+        self.running_pos = torch.zeros(n_classes, device=device)
+        self.running_neg = torch.zeros(n_classes, device=device)
+        self.pos_weight = torch.ones(n_classes, device=device)
+        self.running_count = torch.zeros(1, device=device)
+
+    def _ensure_device(self, device):
+        if self.running_pos.device != device:
+            self.running_pos = self.running_pos.to(device)
+            self.running_neg = self.running_neg.to(device)
+            self.pos_weight = self.pos_weight.to(device)
+            self.running_count = self.running_count.to(device)
+
+    def forward(self, logits, targets):
+        if self.num_classes is None:
+            self._init_buffers(targets.shape[1], targets.device)
+        self._ensure_device(targets.device)
+
+        if self.training:
+            with torch.no_grad():
+                d = 0.0 if self.running_count.item() == 0 else self.decay
+                batch_pos = targets.sum(dim=0)
+                batch_neg = (1 - targets).sum(dim=0)
+                self.running_pos = d * self.running_pos + (1 - d) * batch_pos
+                self.running_neg = d * self.running_neg + (1 - d) * batch_neg
+                self.pos_weight = (self.running_neg + self.epsilon) / (self.running_pos + self.epsilon)
+                self.pos_weight = torch.clamp(self.pos_weight, min=1.0, max=self.max_pos_weight)
+                self.running_count += 1
+
+        return F.binary_cross_entropy_with_logits(
+            logits, targets, pos_weight=self.pos_weight, reduction='mean'
         )
 
 
