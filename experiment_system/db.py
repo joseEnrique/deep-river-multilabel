@@ -71,8 +71,9 @@ def make_exp_name(config: dict) -> str:
     w         = config.get("window_size", "?")
     opt       = config.get("optimizer", "adam")
     norm      = config.get("normalization", "none")
+    epochs    = config.get("epochs", "?")
     bidir     = "_bidir" if config.get("bidirectional") else ""
-    parts = [arch, dataset, f"ph{ph}", f"h{h}", f"nl{nl}", f"w{w}", f"lr{lr}", opt, norm, loss_type]
+    parts = [arch, dataset, f"ph{ph}", f"h{h}", f"nl{nl}", f"w{w}", f"lr{lr}", f"ep{epochs}", opt, norm, loss_type]
     return "".join(str(p) for p in ["_".join(parts), bidir])
 
 
@@ -100,7 +101,7 @@ def get_pending(db_path=None) -> list[tuple[str, str, dict]]:
     """Return (exp_id, exp_name, config) for all pending or failed experiments."""
     with _connect(db_path) as conn:
         rows = conn.execute(
-            "SELECT exp_id, exp_name, config FROM experiments WHERE status IN ('pending', 'failed') ORDER BY rowid"
+            "SELECT exp_id, exp_name, config FROM experiments WHERE status IN ('pending', 'failed') ORDER BY status, exp_name"
         ).fetchall()
     return [(r["exp_id"], r["exp_name"], json.loads(r["config"])) for r in rows]
 
@@ -114,14 +115,15 @@ def get_summary(db_path=None) -> dict:
     return {r["status"]: r["n"] for r in rows}
 
 
-def claim(exp_id: str, db_path=None):
-    """Mark experiment as running."""
+def claim(exp_id: str, db_path=None) -> bool:
+    """Mark experiment as running, atomically. Returns True if claimed."""
     with _connect(db_path) as conn:
-        conn.execute(
-            "UPDATE experiments SET status='running', started_at=? WHERE exp_id=?",
+        cursor = conn.execute(
+            "UPDATE experiments SET status='running', started_at=? WHERE exp_id=? AND status IN ('pending', 'failed')",
             (datetime.now().isoformat(), exp_id)
         )
         conn.commit()
+        return cursor.rowcount > 0
 
 
 def mark_done(exp_id: str, result: dict, db_path=None):

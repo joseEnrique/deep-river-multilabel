@@ -163,7 +163,9 @@ __marimo__/
 
 # --- Custom Additions ---
 /results/
+experiment_system/results/
 .idea/
 .vscode/
 .claude/
 .gemini/
+*.zip
