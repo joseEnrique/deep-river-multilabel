@@ -1,6 +1,6 @@
 # ── Agent identity & backend ─────────────────────────────────────────────────
-backend_url: http://13.37.80.70:8080
-api_key:     Golaso1992?        # null → reads $BACKEND_API_KEY (or no auth if backend has none)
+backend_url: http://localhost:8080
+api_key:     null        # null → reads $BACKEND_API_KEY (or no auth if backend has none)
 agent_id:    null        # null → uses socket.gethostname()
 dataset:     nps        # backend will use DB experiments_<dataset>
 
