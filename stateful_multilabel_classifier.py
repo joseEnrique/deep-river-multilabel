@@ -25,15 +25,25 @@ class OnlineLSTM(nn.Module):
     Output: (batch, n_outputs)
     """
     
-    def __init__(self, num_embeddings: int, embedding_dim: int, hidden_size: int, n_outputs: int):
+    def __init__(self, input_dim=None, output_dim=None,
+                 num_embeddings=155, embedding_dim=128, hidden_size=256,
+                 n_outputs=None, **kwargs):
         super().__init__()
+        n_out = output_dim or n_outputs or 1
         self.embedding = nn.Embedding(num_embeddings, embedding_dim, padding_idx=0)
         self.lstm = nn.LSTM(embedding_dim, hidden_size, batch_first=True)
-        self.head = nn.Linear(hidden_size, n_outputs)
-    
+        self.head = nn.Linear(hidden_size, n_out)
+
     def forward(self, x):
-        # x: (batch, seq_len) - alarm IDs
-        embedded = self.embedding(x)  # (batch, seq_len, embedding_dim)
+        # x can be:
+        #   (batch, 1, seq_len) from Rolling with past_history=1 → squeeze to (batch, seq_len)
+        #   (batch, seq_len) direct
+        #   (batch, past_history, seq_len) from Sequences with past_history>1 → flatten to (batch, past_history*seq_len)
+        if x.dim() == 3:
+            batch = x.size(0)
+            x = x.reshape(batch, -1)  # (batch, past_history * seq_len)
+        x = x.long().clamp(0, 154)
+        embedded = self.embedding(x)  # (batch, total_seq_len, embedding_dim)
         _, (h, _) = self.lstm(embedded)
         return self.head(h[-1])
 
@@ -64,28 +74,36 @@ class OnlineMultiLabelLSTM(base.MultiLabelClassifier):
         self._labels = []
         self._label_set = set()
         self._seq_len = None
-        self._model =  OnlineLSTM(self.NUM_EMBEDDINGS, self.embedding_dim, 
-                                  self.hidden_size, n_labels)
-        self._optimizer = torch.optim.SGD(self._model.parameters(), lr=self.learning_rate)
-    
+        self._model = None
+        self._optimizer = None
+
     def _init_model(self, n_labels: int):
-        self._model = OnlineLSTM(self.NUM_EMBEDDINGS, self.embedding_dim, 
-                                  self.hidden_size, n_labels)
+        old_model = self._model
+        self._model = OnlineLSTM(num_embeddings=self.NUM_EMBEDDINGS, embedding_dim=self.embedding_dim,
+                                  hidden_size=self.hidden_size, n_outputs=n_labels)
+        if old_model is not None:
+            self._model.embedding.load_state_dict(old_model.embedding.state_dict())
+            self._model.lstm.load_state_dict(old_model.lstm.state_dict())
+            old_out = old_model.head.out_features
+            with torch.no_grad():
+                self._model.head.weight[:old_out] = old_model.head.weight
+                self._model.head.bias[:old_out] = old_model.head.bias
         self._optimizer = torch.optim.SGD(self._model.parameters(), lr=self.learning_rate)
-    
+
     def learn_one(self, x: dict, y: dict):
         # Inferir seq_len de la primera muestra
         if self._seq_len is None:
             self._seq_len = len(x)
 
+        new_labels = False
         for label in y:
             if label not in self._label_set:
                 self._label_set.add(label)
                 self._labels.append(label)
-                #self._init_model(len(self._labels))
-        
-        if self._model is None:
-            return self
+                new_labels = True
+
+        if new_labels or self._model is None:
+            self._init_model(len(self._labels))
         
         # Extraer alarm IDs (clamp a num_embeddings - 1)
         alarm_ids = [min(int(x.get(i, 0)), self.NUM_EMBEDDINGS - 1) for i in range(self._seq_len)]

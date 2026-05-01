@@ -155,6 +155,17 @@ class RollingMultiLabelClassifier(RollingDeepEstimator, river_base.MultiLabelCla
         # Mark that we need to re-initialize with correct input_dim
         self.module_initialized = False
 
+        # Override SortedSet to use numeric ordering when keys are numeric strings
+        # Without this, SortedSet sorts "0","1","10","11",...,"2","3" (lexicographic)
+        # instead of "0","1","2","3",...,"10","11" (numeric), which scrambles
+        # the alarm sequence for ALPI-style datasets
+        def _numeric_key(x):
+            try:
+                return (0, int(x))
+            except (ValueError, TypeError):
+                return (1, x)
+        self.observed_features = SortedSet(key=_numeric_key)
+
     def _adapt_input_dim(self, x: Dict):
         """Check if new features appear and update observed_features if needed."""
         self._update_observed_features(x)

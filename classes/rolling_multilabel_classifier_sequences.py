@@ -80,6 +80,7 @@ class RollingMultiLabelClassifierSequences(DeepEstimator, river_base.MultiLabelC
         epochs: int = 1,
         threshold: float = 0.5,
         past_history: int = 1,
+        gradient_scale: float = 1.0,
         **kwargs,
     ):
         # Store parameters
@@ -90,6 +91,7 @@ class RollingMultiLabelClassifierSequences(DeepEstimator, river_base.MultiLabelC
         self.epochs = epochs
         self.output_is_logit = output_is_logit
         self.threshold = threshold
+        self.gradient_scale = gradient_scale
 
         # Store module class and kwargs for later initialization
         self.module_cls = module
@@ -136,8 +138,15 @@ class RollingMultiLabelClassifierSequences(DeepEstimator, river_base.MultiLabelC
         # This guarantees the same tensor memory layout for identical GPU float arithmetic
         self._x_window = deque(maxlen=self.window_size)
         # Track observed features for consistent ordering
+        # Use numeric key so string keys "0","1","2",...,"10" sort numerically
+        # instead of lexicographically ("0","1","10","11",...,"2")
         from sortedcontainers import SortedSet
-        self.observed_features = SortedSet()
+        def _numeric_key(x):
+            try:
+                return (0, int(x))
+            except (ValueError, TypeError):
+                return (1, x)
+        self.observed_features = SortedSet(key=_numeric_key)
         # Ensure y_window is an alias for target_window at init
         self.y_window = self.target_window
 
@@ -411,6 +420,10 @@ class RollingMultiLabelClassifierSequences(DeepEstimator, river_base.MultiLabelC
                 logits = self.module(x_t)
                 loss = self.loss_fn(logits, y_t)
                 loss.backward()
+                if self.gradient_scale != 1.0:
+                    for p in self.module.parameters():
+                        if p.grad is not None:
+                            p.grad.data.mul_(self.gradient_scale)
                 self.optimizer.step()
 
         return self
