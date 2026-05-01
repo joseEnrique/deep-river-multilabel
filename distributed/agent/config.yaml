@@ -1,18 +1,17 @@
 # ── Agent identity & backend ─────────────────────────────────────────────────
-backend_url: http://localhost:8080
-api_key:     null        # null → reads $BACKEND_API_KEY (or no auth if backend has none)
+backend_url: http://13.37.80.70:8080
+api_key:     Golaso1992?        # null → reads $BACKEND_API_KEY (or no auth if backend has none)
 agent_id:    null        # null → uses socket.gethostname()
-dataset:     ai4i        # backend will use DB experiments_<dataset>
+dataset:     nps        # backend will use DB experiments_<dataset>
 
 # GPUs this agent owns. One worker is spawned per device.
 devices:
   - cuda:0
-  - cuda:1
 
 # Slots per GPU (concurrencia). Cada experimento usa 1 slot (LIGHT) o 2 (HEAVY)
 # según su compute_score (ws · hd² · nl, ×1.5 si LSTM; umbral 6.8M).
 # Dos LIGHT pueden compartir GPU; un HEAVY pide la GPU entera.
-max_slots_per_device: 2
+max_slots_per_device: 1 
 
 # Override opcional por device (útil si una GPU tiene menos VRAM):
 # slots_per_device:
@@ -42,42 +41,75 @@ poll_interval: 5         # seconds between empty-poll cycles
 # whatever is pending in the dataset).
 
 model:
-  - architecture:  [Transformer]
-    device:        ["cuda:0"]
-    optimizer:     [sgd, adam]
-    past_history:  [10]
-    window_size:   [200]
-    hidden_dim:    [64]
-    num_layers:    [1]
-    lr:            [0.0001]
-    dropout:       [0.2]
-    bidirectional: [false]
-    normalization: ["layernorm"]
-    seed:          [42]
-    epochs:        [1]
-
+  # ── LSTM
   - architecture:  [LSTM]
     device:        ["cuda:1"]
     optimizer:     [adam]
-    past_history:  [1, 5]
-    window_size:   [200]
+    past_history:  [1, 2, 5]
+    window_size:   [1, 50, 200, 500]
     hidden_dim:    [64, 128]
     num_layers:    [1, 2]
-    lr:            [0.001]
-    dropout:       [0.2]
+    lr:            [0.01, 0.001]
+    dropout:       [0.2, 0]
     bidirectional: [false]
-    normalization: ["layernorm"]
+    normalization: ["none", "layernorm"]
     seed:          [42]
-    epochs:        [1]
+    epochs:        [1, 3]
+
+  # ── MLP (flattened sequence, bidirectional=False implicitly)
+  - architecture:  [MLP]
+    device:        ["cuda:1"]
+    optimizer:     [adam]
+    past_history:  [1, 2, 5]
+    window_size:   [1, 50, 200, 500]
+    hidden_dims:   [[128, 64, 32], [128, 64], [64, 32]]
+    lr:            [0.01, 0.001, 0.0001]
+    dropout:       [0.2, 0]
+    normalization: ["none", "layernorm"]
+    seed:          [42]
+    epochs:        [1, 3]
+
+  # ── CNN
+  - architecture:  [CNN]
+    device:        ["cuda:1"]
+    optimizer:     [adam]
+    past_history:  [1, 2, 5]
+    window_size:   [1, 50, 200, 500]
+    hidden_dim:    [64, 128]
+    num_layers:    [1, 2]
+    lr:            [0.01, 0.001, 0.0001]
+    dropout:       [0.2, 0]
+    normalization: ["none", "layernorm"]
+    seed:          [42]
+    epochs:        [1, 3]
+
+  # ── Transformer
+  - architecture:  [Transformer]
+    device:        ["cuda:2"]
+    optimizer:     [adam]
+    past_history:  [1, 2, 5]
+    window_size:   [1, 50, 200, 500]
+    hidden_dim:    [32, 64, 128]
+    num_layers:    [1, 2]
+    lr:            [0.01, 0.001, 0.0001]
+    dropout:       [0.2, 0]
+    normalization: ["none", "layernorm"]
+    seed:          [42]
+    epochs:        [1, 3]
 
 loss:
   - type: BCE
+
+  # Ganador del sweep estático en NPS: Micro/Macro F1 = 99.77.
   - type: StaticFocal
     alpha: 0.25
     gamma: 2.0
+
+  # Mejor variante del tuning adaptativo en NPS: Micro/Macro F1 = 99.76
+  # (no supera al estático en NPS, pero la dejamos para comparar en otros datasets).
   - type: AdaptiveFocal
     base_gamma: 2.0
     base_alpha: 0.25
-    decay: 0.999
-    alpha_gain: 1.0
-    gamma_gain: 2.0
+    decay: 0.9999
+    alpha_gain: 0.5
+    gamma_gain: 0.5
