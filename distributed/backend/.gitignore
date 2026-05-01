@@ -1,0 +1,4 @@
+backend
+*.exe
+.env
+go.sum

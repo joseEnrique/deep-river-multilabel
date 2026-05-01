@@ -147,6 +147,8 @@ class RollingMultiLabelClassifierSequences(DeepEstimator, river_base.MultiLabelC
             except (ValueError, TypeError):
                 return (1, x)
         self.observed_features = SortedSet(key=_numeric_key)
+        # Ensure y_window is an alias for target_window at init
+        self.y_window = self.target_window
 
     def _update_observed_features(self, x: Dict):
         """Update the set of observed features."""
@@ -257,6 +259,7 @@ class RollingMultiLabelClassifierSequences(DeepEstimator, river_base.MultiLabelC
             first_row = x_df.iloc[0].to_dict()
             first_row_features = {k: v for k, v in first_row.items() if k not in self.label_names}
             self.history_buffer.clear()
+            self.target_window.clear()
             self.y_window.clear()
             # Clear sequence buffers as well (feature dimension changed)
             if hasattr(self, 'sequence_buffer'):
@@ -333,8 +336,9 @@ class RollingMultiLabelClassifierSequences(DeepEstimator, river_base.MultiLabelC
         self.history_buffer.clear()
         for x_vec in x_sequence:
             self.history_buffer.append(x_vec)
+        self.target_window.clear()
         self.y_window.clear()
-        self.y_window.append(y_vec)
+        self.target_window.append(y_vec)
         return self
 
     def _learn_single(self, x: Dict, y: Dict[str, bool]):
@@ -356,6 +360,7 @@ class RollingMultiLabelClassifierSequences(DeepEstimator, river_base.MultiLabelC
             self.history_buffer.clear()
             self.sequence_window.clear()
             self.target_window.clear()
+            self.y_window.clear()
             self._x_window.clear()
             # Clear sequence buffers as well (feature dimension changed)
             if hasattr(self, 'sequence_buffer'):
@@ -366,6 +371,7 @@ class RollingMultiLabelClassifierSequences(DeepEstimator, river_base.MultiLabelC
         if len(self.sequence_window) > 0 and len(self.sequence_window[-1][0]) != len(self.observed_features):
             self.sequence_window.clear()
             self.target_window.clear()
+            self.y_window.clear()
             self.history_buffer.clear()
             self._x_window.clear()
             
@@ -386,6 +392,21 @@ class RollingMultiLabelClassifierSequences(DeepEstimator, river_base.MultiLabelC
         
         y_vec = [float(y.get(label, 0)) for label in self.label_names]
         self.target_window.append(y_vec)
+
+        # --- TEMPORAL DEBUG START ---
+        if not hasattr(self, '_debug_counter'):
+            self._debug_counter = 0
+        self._debug_counter += 1
+        
+        if self._debug_counter == 51:
+            print(f"\n[TEMPORAL DEBUG] Dentro de RollingMultiLabelClassifierSequences (past_history={self.past_history})")
+            print(f"Features observadas en este punto: {list(self.observed_features)}")
+            print(f"Secuencia X cruda en current_seq:")
+            for t_step in current_seq:
+                print(f"  {[round(v, 4) if isinstance(v, float) else v for v in t_step]}")
+            y_with_labels = [f"{val} ({label})" for val, label in zip(y_vec, self.label_names)]
+            print(f"Vector y (y_vec): {y_with_labels}\n")
+        # --- TEMPORAL DEBUG END ---
 
         # Train at every step using the current window (even if not full yet)
         if len(self.sequence_window) > 0:
@@ -546,6 +567,17 @@ class RollingMultiLabelClassifierSequences(DeepEstimator, river_base.MultiLabelC
         if len(self.observed_features) > prev_num_features:
             print(f"⚠ Warning: New features detected in predict ({prev_num_features} -> {len(self.observed_features)}). Reinitializing model...")
             self._initialize_module(x)
+            # Clear all buffers to ensure consistent warm-up and prevent dimension crash
+            self.history_buffer.clear()
+            self.sequence_window.clear()
+            self.target_window.clear()
+            self.y_window.clear()
+            self._x_window.clear()
+            if hasattr(self, 'sequence_buffer'):
+                self.sequence_buffer.clear()
+                # self.target_buffer is also used in _learn_sequence
+                if hasattr(self, 'target_buffer'):
+                    self.target_buffer.clear()
 
         # Check if we have enough context (RollingMultiLabelClassifier equivalence)
         if len(self.sequence_window) + 1 < self.window_size:
@@ -615,6 +647,10 @@ class RollingMultiLabelClassifierSequences(DeepEstimator, river_base.MultiLabelC
             print(f"⚠ Warning: New features detected in predict_proba ({prev_num_features} -> {len(self.observed_features)}). Reinitializing model...")
             self._initialize_module(x)
             self.history_buffer.clear()
+            self.sequence_window.clear()
+            self.target_window.clear()
+            self.y_window.clear()
+            self._x_window.clear()
 
         # Check if we have enough context (RollingMultiLabelClassifier equivalence)
         if len(self.sequence_window) + 1 < self.window_size:

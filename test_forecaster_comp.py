@@ -15,7 +15,7 @@ from metrics import HammingLoss, ExampleF1, ExamplePrecision, ExampleRecall
 from river import preprocessing
 
 target_names = ['TWF', 'HDF', 'PWF', 'OSF', 'RNF']
-window_size = 200
+window_size = 10
 
 def run_experiment(model_type, past_history=1, device_str="cpu", loss_fn=None, loss_name="AdaptiveFocal"):
     base_name = f"{model_type} (past={past_history})" if model_type == "RollingMultiLabelClassifierSequences" else model_type
@@ -133,7 +133,8 @@ if __name__ == "__main__":
 
     for loss_name, loss_fn in loss_functions:
         res = run_experiment(
-            "RollingMultiLabelClassifier",
+            "RollingMultiLabelClassifierSequences",
+            past_history=2,
             device_str=device_str,
             loss_fn=loss_fn,
             loss_name=loss_name,

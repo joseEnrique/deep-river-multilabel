@@ -1,0 +1,84 @@
+# ── Agent identity & backend ─────────────────────────────────────────────────
+backend_url: http://localhost:8080
+api_key:     null        # null → reads $BACKEND_API_KEY (or no auth if backend has none)
+agent_id:    null        # null → uses socket.gethostname()
+dataset:     ai4i        # backend will use DB experiments_<dataset>
+
+# GPUs this agent owns. One dispatcher thread per device.
+devices:
+  - cuda:0
+  - cuda:1
+
+# Slots per GPU (concurrencia). Cada experimento usa 1 slot (LIGHT) o 2 (HEAVY)
+# según su compute_score (ws · hd² · nl, ×1.5 si LSTM; umbral 6.8M).
+# Dos LIGHT pueden compartir GPU; un HEAVY pide la GPU entera.
+max_slots_per_device: 2
+
+# Override opcional por device (útil si una GPU tiene menos VRAM):
+# slots_per_device:
+#   cuda:0: 2
+#   cuda:1: 1
+
+
+# If true (default), each dispatcher claims ANY pending experiment from the
+# dataset (even if registered by another agent). The `device` field on a
+# registered config is used as a SOFT preference for routing, never a hard
+# filter. Set to false to restrict this agent to experiments it registered.
+consume_any: true
+
+# Local SQLite mirror — every state change (register, claim, checkpoint,
+# finish, fail) is also written here. Acts as an offline log if the backend
+# is unavailable. Defaults to ./local_<dataset>.db
+local_db_path: null
+
+checkpoint_every: 1000
+poll_interval: 5         # seconds between empty-poll cycles
+
+# ── Experiment grid (optional) ───────────────────────────────────────────────
+# Same shape as experiment_system/config.yaml. Registration is idempotent:
+# if another agent already registered a config, the backend returns 409 and
+# we skip silently — nothing is overwritten.
+#
+# Omit this section entirely to run as a pure consumer (no grid, just claim
+# whatever is pending in the dataset).
+
+model:
+  - architecture:  [Transformer]
+    device:        ["cuda:0"]
+    optimizer:     [sgd, adam]
+    past_history:  [10]
+    window_size:   [200]
+    hidden_dim:    [64]
+    num_layers:    [1]
+    lr:            [0.0001]
+    dropout:       [0.2]
+    bidirectional: [false]
+    normalization: ["layernorm"]
+    seed:          [42]
+    epochs:        [1]
+
+  - architecture:  [LSTM]
+    device:        ["cuda:1"]
+    optimizer:     [adam]
+    past_history:  [1, 5]
+    window_size:   [200]
+    hidden_dim:    [64, 128]
+    num_layers:    [1, 2]
+    lr:            [0.001]
+    dropout:       [0.2]
+    bidirectional: [false]
+    normalization: ["layernorm"]
+    seed:          [42]
+    epochs:        [1]
+
+loss:
+  - type: BCE
+  - type: StaticFocal
+    alpha: 0.25
+    gamma: 2.0
+  - type: AdaptiveFocal
+    base_gamma: 2.0
+    base_alpha: 0.25
+    decay: 0.999
+    alpha_gain: 1.0
+    gamma_gain: 2.0
