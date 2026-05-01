@@ -357,6 +357,18 @@ def main():
         print(f"  avg duration / done: {avg:.1f}s")
         print(f"  total compute (done): {fmt_eta(tot)}")
         print(f"  ETA pending+failed  : {fmt_eta(eta)}  ({s.get('eta_method')})")
+
+        running = s.get("running") or []
+        if running:
+            print(f"\n[running] {len(running)} experimento(s) en curso:")
+            print(f"  {'ARCH':<12} {'AGENT':<24} {'DEVICE':<10} {'ELAPSED':>10}  EXP_NAME")
+            for r in running:
+                arch = r.get("architecture") or "-"
+                ag = r.get("agent_id") or "-"
+                dev = r.get("device") or "-"
+                el = fmt_eta(r.get("elapsed_s") or 0.0)
+                name = r.get("exp_name", "?")
+                print(f"  {arch:<12} {ag:<24} {dev:<10} {el:>10}  {name}")
         return
 
     grid = build_grid(cfg)

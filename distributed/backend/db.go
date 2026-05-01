@@ -486,6 +486,48 @@ func (s *Store) Summary(ctx context.Context, dataset string) (*SummaryResponse, 
 	} else {
 		out.EtaMethod = "n/a (no done duration data or no pending)"
 	}
+
+	// Lista de experimentos actualmente corriendo (para el resumen).
+	runOpts := options.Find().
+		SetProjection(bson.M{
+			"_id":          1,
+			"architecture": 1,
+			"agent_id":     1,
+			"device":       1,
+			"started_at":   1,
+		}).
+		SetSort(bson.D{{Key: "started_at", Value: 1}})
+	runCur, err := c.Find(ctx, bson.M{"status": StatusRunning}, runOpts)
+	if err != nil {
+		return nil, err
+	}
+	defer runCur.Close(ctx)
+	out.Running = []RunningExperiment{}
+	now := time.Now().UTC()
+	for runCur.Next(ctx) {
+		var r struct {
+			ID           string     `bson:"_id"`
+			Architecture string     `bson:"architecture"`
+			AgentID      string     `bson:"agent_id"`
+			Device       string     `bson:"device"`
+			StartedAt    *time.Time `bson:"started_at"`
+		}
+		if err := runCur.Decode(&r); err != nil {
+			return nil, err
+		}
+		elapsed := 0.0
+		if r.StartedAt != nil {
+			elapsed = now.Sub(*r.StartedAt).Seconds()
+		}
+		out.Running = append(out.Running, RunningExperiment{
+			ExpName:      r.ID,
+			Architecture: r.Architecture,
+			AgentID:      r.AgentID,
+			Device:       r.Device,
+			StartedAt:    r.StartedAt,
+			ElapsedS:     elapsed,
+		})
+	}
 	return out, nil
 }
 

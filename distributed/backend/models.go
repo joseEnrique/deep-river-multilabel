@@ -69,15 +69,25 @@ type StatsResponse struct {
 	Counts  map[string]int `json:"counts"`
 }
 
+type RunningExperiment struct {
+	ExpName      string     `json:"exp_name"`
+	Architecture string     `json:"architecture,omitempty"`
+	AgentID      string     `json:"agent_id,omitempty"`
+	Device       string     `json:"device,omitempty"`
+	StartedAt    *time.Time `json:"started_at,omitempty"`
+	ElapsedS     float64    `json:"elapsed_s"`
+}
+
 type SummaryResponse struct {
-	Dataset        string         `json:"dataset"`
-	Total          int64          `json:"total"`
-	Counts         map[string]int `json:"counts"`
-	DoneCount      int            `json:"done_count"`
-	AvgDurationS   float64        `json:"avg_duration_s"`
-	TotalDurationS float64        `json:"total_duration_s"`
-	EtaS           float64        `json:"eta_s"`
-	EtaMethod      string         `json:"eta_method"`
+	Dataset        string              `json:"dataset"`
+	Total          int64               `json:"total"`
+	Counts         map[string]int      `json:"counts"`
+	DoneCount      int                 `json:"done_count"`
+	AvgDurationS   float64             `json:"avg_duration_s"`
+	TotalDurationS float64             `json:"total_duration_s"`
+	EtaS           float64             `json:"eta_s"`
+	EtaMethod      string              `json:"eta_method"`
+	Running        []RunningExperiment `json:"running"`
 }
 
 type ErrorResponse struct {
