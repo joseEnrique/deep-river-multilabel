@@ -169,3 +169,7 @@ experiment_system/results/
 .claude/
 .gemini/
 *.zip
+
+# Agent runtime config (specific to each machine: api_key, devices, slots).
+# Use distributed/agent/config.example.yaml as a template.
+distributed/agent/config.yaml

@@ -233,35 +233,38 @@ def main():
             
         import threading
         
-        max_slots = 2
+        max_slots = 4
         available_slots = max_slots
         condition = threading.Condition()
-        
+
         def get_slots_needed(cfg):
             arch = cfg.get("arch", cfg.get("architecture", ""))
             ws = cfg.get("window_size", 1)
-            
+
             hd = cfg.get("hidden_dim", 32)
             if isinstance(hd, list): hd = max(hd)
             elif "hidden_dims" in cfg: hd = max(cfg["hidden_dims"])
-            
+
             nl = cfg.get("num_layers", 1)
 
             # Base compute
             compute_score = ws * (hd ** 2) * nl
-            
+
             # Penalizaciones
             if arch == "Transformer":
                 compute_score += (ws ** 2) * hd * nl
             elif arch == "LSTM":
                 compute_score *= 1.5
-                
-            # Techo empírico del MEDIUM de Transformer (ws=200, hd=64, nl=2)
+
+            # Tiers: SMALL (1 slot, ~25% GPU) / MEDIUM (2, ~50%) / LARGE (4, 100%)
+            SMALL_CEILING = 1_500_000
             MEDIUM_CEILING = 6_800_000
-            
-            if compute_score > MEDIUM_CEILING:
-                return 2  # HEAVY
-            return 1      # MEDIUM/SMALL
+
+            if compute_score <= SMALL_CEILING:
+                return 1  # SMALL
+            if compute_score <= MEDIUM_CEILING:
+                return 2  # MEDIUM
+            return 4      # LARGE
         
         futures = []
 
