@@ -214,11 +214,6 @@ def worker_main(device: str, agent_id: str, dataset: str, base_url: str,
 
     available_slots = max_slots
     cond = threading.Condition()
-    # Política: siempre dejar 1 slot libre salvo cuando entra un LARGE solo
-    # (LARGE ocupa toda la GPU). Esto evita saturar la GPU al 100% con
-    # combinaciones de SMALL/MEDIUM que sumen max_slots.
-    # Ejemplos con max_slots=4: máx 3 SMALL  ó  1 MEDIUM + 1 SMALL  ó  1 LARGE.
-    # Ejemplos con max_slots=3: máx 2 SMALL  ó  1 MEDIUM + 1 SMALL.
 
     def release_cb(slots_used: int):
         def _cb(_fut):
@@ -261,10 +256,6 @@ def worker_main(device: str, agent_id: str, dataset: str, base_url: str,
                 with cond:
                     if slots_needed > available_slots:
                         continue  # no cabe ahora; intenta el siguiente
-                    # Reserva 1 slot libre salvo que sea un LARGE ocupando toda la GPU.
-                    is_full_gpu = slots_needed == max_slots
-                    if not is_full_gpu and (available_slots - slots_needed) < 1:
-                        continue  # llenaría todos los slots con SMALL/MEDIUM; bloqueado
 
                 name = exp["exp_name"]
                 claimed = client.claim(name, device=device)
