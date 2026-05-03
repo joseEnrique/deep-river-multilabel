@@ -255,6 +255,8 @@ def main():
                 compute_score += (ws ** 2) * hd * nl
             elif arch == "LSTM":
                 compute_score *= 1.5
+            elif arch in ("MLP", "CNN"):
+                compute_score *= 0.3   # MLP/CNN son mucho más ligeros que un LSTM equivalente
 
             # Tiers: SMALL (1 slot, ~25% GPU) / MEDIUM (2, ~50%) / LARGE (4, 100%)
             SMALL_CEILING = 1_500_000

@@ -38,6 +38,8 @@ def get_slots_needed(cfg: dict) -> int:
         score += (ws ** 2) * hd * nl
     elif arch == "LSTM":
         score *= 1.5
+    elif arch in ("MLP", "CNN"):
+        score *= 0.3   # MLP/CNN son mucho más ligeros que un LSTM equivalente
 
     if score <= SMALL_CEILING:
         return SMALL_SLOTS

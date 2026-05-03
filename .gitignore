@@ -173,3 +173,8 @@ experiment_system/results/
 # Agent runtime config (specific to each machine: api_key, devices, slots).
 # Use distributed/agent/config.example.yaml as a template.
 distributed/agent/config.yaml
+
+# Local SQLite mirror del agent (offline log; se recrea al arrancar).
+distributed/agent/local_*.db
+distributed/agent/local_*.db-shm
+distributed/agent/local_*.db-wal
