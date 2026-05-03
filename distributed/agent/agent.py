@@ -338,6 +338,8 @@ def main():
         return
 
     if args.summary:
+        import re
+        from slots import get_slots_needed
         s = client.summary()
 
         def fmt_eta(secs: float) -> str:
@@ -345,6 +347,29 @@ def main():
             h, rem = divmod(secs, 3600)
             m, sec = divmod(rem, 60)
             return f"{h}h{m:02d}m{sec:02d}s"
+
+        def parse_cfg_from_name(name: str) -> dict:
+            """Extrae arch, hidden_dim(s), num_layers y window_size desde el exp_name."""
+            m = re.match(
+                r"^(?P<arch>[A-Za-z]+)_[^_]+_ph\d+_h(?P<hd>[\d\-]+)_nl(?P<nl>\d+)_w(?P<ws>\d+)_",
+                name,
+            )
+            if not m:
+                return {}
+            hd_raw = m.group("hd")
+            cfg = {
+                "architecture": m.group("arch"),
+                "num_layers":   int(m.group("nl")),
+                "window_size":  int(m.group("ws")),
+            }
+            if "-" in hd_raw:
+                cfg["hidden_dims"] = [int(x) for x in hd_raw.split("-")]
+            else:
+                cfg["hidden_dim"] = int(hd_raw)
+            return cfg
+
+        def tier_label(slots: int) -> str:
+            return {1: "SMALL", 2: "MEDIUM", 4: "LARGE"}.get(slots, f"{slots}slots")
 
         counts = s.get("counts", {})
         print(f"[summary] dataset={s.get('dataset')} total={s.get('total')}")
@@ -360,15 +385,42 @@ def main():
 
         running = s.get("running") or []
         if running:
-            print(f"\n[running] {len(running)} experimento(s) en curso:")
-            print(f"  {'ARCH':<12} {'AGENT':<24} {'DEVICE':<10} {'ELAPSED':>10}  EXP_NAME")
+            # Tier breakdown global y por (agent, device)
+            from collections import defaultdict
+            tiers = {"SMALL": 0, "MEDIUM": 0, "LARGE": 0, "?": 0}
+            by_node = defaultdict(lambda: {"SMALL": 0, "MEDIUM": 0, "LARGE": 0, "?": 0})
+            running_with_tier = []
             for r in running:
+                cfg_inferred = parse_cfg_from_name(r.get("exp_name", ""))
+                if cfg_inferred:
+                    slots = get_slots_needed(cfg_inferred)
+                    label = tier_label(slots)
+                else:
+                    slots = 0
+                    label = "?"
+                tiers[label] += 1
+                key = (r.get("agent_id") or "-", r.get("device") or "-")
+                by_node[key][label] += 1
+                running_with_tier.append((r, label, slots))
+
+            print(f"\n[running] {len(running)} experimento(s) en curso:")
+            print(f"  tiers: SMALL={tiers['SMALL']}  MEDIUM={tiers['MEDIUM']}  "
+                  f"LARGE={tiers['LARGE']}" + (f"  ?={tiers['?']}" if tiers['?'] else ""))
+
+            print(f"\n[by node × device]")
+            print(f"  {'AGENT':<24} {'DEVICE':<10} {'SMALL':>6} {'MEDIUM':>7} {'LARGE':>6}  TOTAL")
+            for (ag, dev), c in sorted(by_node.items()):
+                total = c["SMALL"] + c["MEDIUM"] + c["LARGE"] + c["?"]
+                print(f"  {ag:<24} {dev:<10} {c['SMALL']:>6} {c['MEDIUM']:>7} {c['LARGE']:>6}  {total:>5}")
+
+            print(f"\n  {'TIER':<7} {'ARCH':<12} {'AGENT':<24} {'DEVICE':<10} {'ELAPSED':>10}  EXP_NAME")
+            for r, label, _ in running_with_tier:
                 arch = r.get("architecture") or "-"
                 ag = r.get("agent_id") or "-"
                 dev = r.get("device") or "-"
                 el = fmt_eta(r.get("elapsed_s") or 0.0)
                 name = r.get("exp_name", "?")
-                print(f"  {arch:<12} {ag:<24} {dev:<10} {el:>10}  {name}")
+                print(f"  {label:<7} {arch:<12} {ag:<24} {dev:<10} {el:>10}  {name}")
         return
 
     grid = build_grid(cfg)
