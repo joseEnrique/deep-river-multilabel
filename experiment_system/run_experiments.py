@@ -260,7 +260,7 @@ def main():
 
             # Tiers: SMALL (1 slot, ~25% GPU) / MEDIUM (2, ~50%) / LARGE (4, 100%)
             SMALL_CEILING = 1_500_000
-            MEDIUM_CEILING = 6_800_000
+            MEDIUM_CEILING = 15_000_000
 
             if compute_score <= SMALL_CEILING:
                 return 1  # SMALL
