@@ -213,13 +213,16 @@ def worker_main(device: str, agent_id: str, dataset: str, base_url: str,
           f"max_slots={max_slots})", flush=True)
 
     available_slots = max_slots
+    transformers_running = 0  # contador de Transformers activos en este worker
     cond = threading.Condition()
 
-    def release_cb(slots_used: int):
+    def release_cb(slots_used: int, was_transformer: bool):
         def _cb(_fut):
-            nonlocal available_slots
+            nonlocal available_slots, transformers_running
             with cond:
                 available_slots += slots_used
+                if was_transformer:
+                    transformers_running -= 1
                 cond.notify_all()
         return _cb
 
@@ -253,17 +256,20 @@ def worker_main(device: str, agent_id: str, dataset: str, base_url: str,
                 cfg = exp["config"]
                 slots_needed = get_slots_needed(cfg)
 
+                arch = cfg.get("architecture") or cfg.get("arch") or ""
+                will_be_transformer = (arch == "Transformer")
+
                 with cond:
                     if slots_needed > available_slots:
                         continue  # no cabe ahora; intenta el siguiente
-                    # Solo Transformer reserva 1 slot libre alrededor (la self-
-                    # attention satura el bus mucho más que LSTM/MLP/CNN).
-                    # Excepción: un Transformer LARGE que ocupa toda la GPU.
-                    arch = cfg.get("architecture") or cfg.get("arch") or ""
-                    if arch == "Transformer":
-                        is_full_gpu = slots_needed == max_slots
-                        if not is_full_gpu and (available_slots - slots_needed) < 1:
-                            continue
+                    # Si ya hay un Transformer corriendo en esta GPU, o si el
+                    # que va a entrar es Transformer, reservamos 1 slot libre
+                    # (self-attention satura el bus mucho más que LSTM/MLP/CNN).
+                    # Excepción: un Transformer LARGE solo ocupa toda la GPU.
+                    needs_reserve = will_be_transformer or transformers_running > 0
+                    is_full_gpu = slots_needed == max_slots
+                    if needs_reserve and not is_full_gpu and (available_slots - slots_needed) < 1:
+                        continue
 
                 name = exp["exp_name"]
                 claimed = client.claim(name, device=device)
@@ -275,13 +281,15 @@ def worker_main(device: str, agent_id: str, dataset: str, base_url: str,
 
                 with cond:
                     available_slots -= slots_needed
+                    if will_be_transformer:
+                        transformers_running += 1
 
                 fut = executor.submit(
                     _run_one_task,
                     name, cfg, device, dataset, base_url, agent_id,
                     api_key, checkpoint_every, local_db_path,
                 )
-                fut.add_done_callback(release_cb(slots_needed))
+                fut.add_done_callback(release_cb(slots_needed, will_be_transformer))
                 launched_any = True
 
                 with cond:
