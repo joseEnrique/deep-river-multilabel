@@ -256,6 +256,14 @@ def worker_main(device: str, agent_id: str, dataset: str, base_url: str,
                 with cond:
                     if slots_needed > available_slots:
                         continue  # no cabe ahora; intenta el siguiente
+                    # Solo Transformer reserva 1 slot libre alrededor (la self-
+                    # attention satura el bus mucho más que LSTM/MLP/CNN).
+                    # Excepción: un Transformer LARGE que ocupa toda la GPU.
+                    arch = cfg.get("architecture") or cfg.get("arch") or ""
+                    if arch == "Transformer":
+                        is_full_gpu = slots_needed == max_slots
+                        if not is_full_gpu and (available_slots - slots_needed) < 1:
+                            continue
 
                 name = exp["exp_name"]
                 claimed = client.claim(name, device=device)
