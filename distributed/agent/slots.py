@@ -10,7 +10,7 @@ misma GPU, o 1 MEDIUM + 2 SMALL.
 # Boundary scores (compute_score = ws · hd² · nl, ×1.5 si LSTM,
 # + ws² · hd · nl si Transformer, ×0.3 si MLP/CNN).
 SMALL_CEILING = 1_500_000    # ≤ → SMALL (1 slot)
-MEDIUM_CEILING = 15_000_000  # ≤ → MEDIUM (2 slots), > → LARGE (4 slots)
+MEDIUM_CEILING = 30_000_000  # ≤ → MEDIUM (2 slots), > → LARGE (4 slots)
 
 # Default si el config del agent no define `max_slots_per_device`.
 DEFAULT_MAX_SLOTS_PER_GPU = 4
