@@ -562,10 +562,12 @@ class AlpiMLP(nn.Module):
     MLP para secuencias de alarm IDs (ALPI).
 
     Embedding al frente; los embeddings de toda la secuencia se aplanan
-    y pasan por un stack de capas densas. La primera capa es LazyLinear
-    porque la longitud total (past_history × seq_len) se descubre en runtime.
+    y pasan por un stack de capas densas. La primera capa es Linear con
+    dim = input_dim × past_history × embedding_dim (el classifier pasa
+    input_dim al re-instanciar el módulo con n_features real).
     """
     def __init__(self, output_dim,
+                 input_dim=1,
                  num_alarms=155, embedding_dim=32,
                  hidden_dims=None, hidden_dim=64, num_layers=2,
                  dropout=0.3, normalization="none",
@@ -577,14 +579,15 @@ class AlpiMLP(nn.Module):
         if hidden_dims is None:
             hidden_dims = [hidden_dim] * num_layers
 
+        # Total tokens tras aplanar past_history × seq_len; cada token aporta
+        # embedding_dim features a la primera densa.
+        flat_dim = int(input_dim) * int(past_history) * int(embedding_dim)
+
         norm_type = str(normalization).lower()
         layers = []
-        prev_dim = None
-        for i, hd in enumerate(hidden_dims):
-            if i == 0:
-                layers.append(nn.LazyLinear(hd))
-            else:
-                layers.append(nn.Linear(prev_dim, hd))
+        prev_dim = flat_dim
+        for hd in hidden_dims:
+            layers.append(nn.Linear(prev_dim, hd))
             if norm_type == "layernorm":
                 layers.append(nn.LayerNorm(hd))
             elif norm_type == "batchnorm":
