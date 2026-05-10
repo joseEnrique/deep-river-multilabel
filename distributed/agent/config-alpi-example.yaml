@@ -148,8 +148,8 @@ loss:
     alpha: 0.25
     gamma: 2.0
   - type: AdaptiveFocal
-    base_gamma: 2.0
-    base_alpha: 0.25
-    decay: 0.999
-    alpha_gain: 1.0
-    gamma_gain: 2.0
+    base_gamma: 1.0
+    base_alpha: 0.6
+    decay: 0.9
+    alpha_gain: 0.25
+    gamma_gain: 0.25
