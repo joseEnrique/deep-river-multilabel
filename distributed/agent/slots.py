@@ -35,7 +35,10 @@ def get_slots_needed(cfg: dict) -> int:
 
     score = ws * (hd ** 2) * nl
     if arch == "Transformer":
-        score += (ws ** 2) * hd * nl
+        # Self-attention escala O(ws²) en FLOPs, pero las RTX 3090 paralelizan
+        # bien matmuls grandes y el % real de GPU usado es bastante menor que
+        # lo que sugeriría el conteo teórico → factor 0.2.
+        score += (ws ** 2) * hd * nl * 0.2
     elif arch == "LSTM":
         score *= 1.5
     elif arch in ("MLP", "CNN"):

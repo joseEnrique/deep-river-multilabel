@@ -213,16 +213,25 @@ def worker_main(device: str, agent_id: str, dataset: str, base_url: str,
           f"max_slots={max_slots})", flush=True)
 
     available_slots = max_slots
-    transformers_running = 0  # contador de Transformers activos en este worker
+    # Contadores de Transformer activos en este worker, separados por tier:
+    # SMALL=1 slot, otros (MEDIUM=2, LARGE=4). Permite reglas distintas para
+    # saturación con SMALLs (no permitida) vs. saturación con MEDIUM/LARGE
+    # (permitida — 2 MEDIUM o 1 LARGE).
+    transformer_smalls_running = 0
+    transformer_others_running = 0
     cond = threading.Condition()
 
     def release_cb(slots_used: int, was_transformer: bool):
         def _cb(_fut):
-            nonlocal available_slots, transformers_running
+            nonlocal available_slots
+            nonlocal transformer_smalls_running, transformer_others_running
             with cond:
                 available_slots += slots_used
                 if was_transformer:
-                    transformers_running -= 1
+                    if slots_used == 1:
+                        transformer_smalls_running -= 1
+                    else:
+                        transformer_others_running -= 1
                 cond.notify_all()
         return _cb
 
@@ -262,14 +271,23 @@ def worker_main(device: str, agent_id: str, dataset: str, base_url: str,
                 with cond:
                     if slots_needed > available_slots:
                         continue  # no cabe ahora; intenta el siguiente
-                    # Si ya hay un Transformer corriendo en esta GPU, o si el
-                    # que va a entrar es Transformer, reservamos 1 slot libre
-                    # (self-attention satura el bus mucho más que LSTM/MLP/CNN).
-                    # Excepción: un Transformer LARGE solo ocupa toda la GPU.
-                    needs_reserve = will_be_transformer or transformers_running > 0
-                    is_full_gpu = slots_needed == max_slots
-                    if needs_reserve and not is_full_gpu and (available_slots - slots_needed) < 1:
-                        continue
+                    # Reglas SOLO cuando el que entra es Transformer:
+                    #   - hasta 3 SMALL Transformer (max_slots-1 con max=4)
+                    #   - hasta 2 MEDIUM Transformer (saturan al 100%, OK)
+                    #   - 1 LARGE solo (caso full_gpu trivial)
+                    #   - NO mezclar SMALL Transformer cuando se saturaría la GPU.
+                    # LSTM/MLP/CNN entran sin restricción (aunque haya Transformer
+                    # corriendo).
+                    if will_be_transformer:
+                        is_full_gpu = slots_needed == max_slots
+                        slots_after = available_slots - slots_needed
+                        if not is_full_gpu and slots_after < 1:
+                            # Saturación al 100% con Transformer entrante.
+                            # Permitido solo si NINGÚN SMALL participa
+                            # (2 MEDIUM = 4 slots OK; 4 SMALL = 4 slots NO).
+                            new_is_small = slots_needed == 1
+                            if new_is_small or transformer_smalls_running > 0:
+                                continue
 
                 name = exp["exp_name"]
                 claimed = client.claim(name, device=device)
@@ -282,7 +300,10 @@ def worker_main(device: str, agent_id: str, dataset: str, base_url: str,
                 with cond:
                     available_slots -= slots_needed
                     if will_be_transformer:
-                        transformers_running += 1
+                        if slots_needed == 1:
+                            transformer_smalls_running += 1
+                        else:
+                            transformer_others_running += 1
 
                 fut = executor.submit(
                     _run_one_task,

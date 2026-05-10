@@ -252,7 +252,7 @@ def main():
 
             # Penalizaciones
             if arch == "Transformer":
-                compute_score += (ws ** 2) * hd * nl
+                compute_score += (ws ** 2) * hd * nl * 0.2
             elif arch == "LSTM":
                 compute_score *= 1.5
             elif arch in ("MLP", "CNN"):
