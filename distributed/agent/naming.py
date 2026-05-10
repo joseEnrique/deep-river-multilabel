@@ -54,6 +54,31 @@ def _loss_token(loss_cfg: dict) -> str:
     return "_".join(parts)
 
 
+def _alpi_token(config: dict) -> str:
+    """Compact token capturing the ALPI dataset parameters that change samples.
+    Only emitted when dataset == 'alpi' so AI4I/NPS names stay unchanged."""
+    if config.get("dataset") != "alpi":
+        return ""
+    parts = []
+    for short, key in (("m", "machine"), ("iw", "input_win"), ("ow", "output_win"),
+                       ("dl", "delta"), ("sg", "sigma"), ("mc", "min_count")):
+        if key in config and config[key] is not None:
+            parts.append(f"{short}{_fmt_num(config[key])}")
+    return "_" + "-".join(parts) if parts else ""
+
+
+def _embedding_token(config: dict) -> str:
+    """Embedding hyperparams (only present for alpi-style models)."""
+    if config.get("dataset") != "alpi":
+        return ""
+    parts = []
+    if "embedding_dim" in config and config["embedding_dim"] is not None:
+        parts.append(f"e{_fmt_num(config['embedding_dim'])}")
+    if "num_alarms" in config and config["num_alarms"] is not None:
+        parts.append(f"na{_fmt_num(config['num_alarms'])}")
+    return "_" + "-".join(parts) if parts else ""
+
+
 def make_exp_name(config: dict) -> str:
     """Build the canonical, exhaustive exp_name from a flat config dict."""
     arch    = config.get("architecture", "LSTM")
@@ -68,6 +93,8 @@ def make_exp_name(config: dict) -> str:
     norm    = config.get("normalization", "none")
     bidir   = "_bidir" if config.get("bidirectional") else ""
     loss    = _loss_token(config.get("loss", {"type": "BCE"}))
+    alpi    = _alpi_token(config)
+    emb     = _embedding_token(config)
 
     parts = [
         arch, dataset,
@@ -83,4 +110,4 @@ def make_exp_name(config: dict) -> str:
         norm,
         loss,
     ]
-    return "_".join(str(p) for p in parts) + bidir
+    return "_".join(str(p) for p in parts) + bidir + alpi + emb

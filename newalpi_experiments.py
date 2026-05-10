@@ -24,7 +24,7 @@ from custommetrics.multioutput import MacroAverage, MicroAverage
 
 from datasets.multioutput.newalpi import NewAlpi
 from classes.rolling_multilabel_classifier import RollingMultiLabelClassifier
-from testclassifier.model import AlpiOneHotLSTM, WeightedFocalLoss
+from testclassifier.model import AlpiLSTM, WeightedFocalLoss
 
 
 def run_evaluation_process(exp_name, loss_fn, config, device, queue):
@@ -45,7 +45,7 @@ def run_evaluation_process(exp_name, loss_fn, config, device, queue):
         thresholds = {t: config['threshold'] for t in label_names}
         
         clf = RollingMultiLabelClassifier(
-            module=AlpiOneHotLSTM,
+            module=AlpiLSTM,
             label_names=label_names,
             optimizer_fn="adam",
             lr=config['lr'],

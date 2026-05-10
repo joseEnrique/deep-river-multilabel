@@ -2,8 +2,8 @@
 runner.py — Single experiment executor.
 
 Supports:
-  - Architectures: LSTM, MLP
-  - Datasets:      ai4i, nps
+  - Architectures: LSTM, MLP, CNN, Transformer
+  - Datasets:      ai4i, nps, alpi
   - Optimizers:    adam, sgd
   - Losses:        BCE, StaticFocal, FullAdaptive, ImprovedAdaptive
 """
@@ -28,15 +28,22 @@ sys.path.insert(0, str(ROOT))
 
 from datasets.multioutput import Ai4i
 from datasets.multioutput.nps import NPS
+from datasets.multioutput.newalpi import NewAlpi
 from classes.rolling_multilabel_classifier_sequences import RollingMultiLabelClassifierSequences
 from testclassifier.model import (
-    LSTM_MultiLabel, MLP_MultiLabel, CNN_MultiLabel, Transformer_MultiLabel
+    LSTM_MultiLabel, MLP_MultiLabel, CNN_MultiLabel, Transformer_MultiLabel,
+    AlpiLSTM, AlpiMLP, AlpiCNN, AlpiTransformer,
 )
 from testclassifier.loss import FocalLoss, AdaptiveFocalLoss
 import evaluate as _evaluate
 from metrics import HammingLoss, ExampleF1, ExamplePrecision, ExampleRecall
 
 # ── Dataset registry ──────────────────────────────────────────────────────────
+# For datasets with fixed schema (ai4i, nps) we declare label_names/output_dim.
+# For alpi the output schema depends on (machine, input_win, output_win, ...)
+# so we mark it `dynamic=True` and resolve labels by instantiating the dataset.
+
+ALPI_PARAM_KEYS = ("machine", "input_win", "output_win", "delta", "sigma", "min_count")
 
 DATASETS = {
     "ai4i": {
@@ -49,15 +56,29 @@ DATASETS = {
         "label_names": ['PRP', 'HLL', 'GTC', 'GT'],
         "output_dim":  4,
     },
+    "alpi": {
+        "cls":     NewAlpi,
+        "dynamic": True,
+        "param_keys": ALPI_PARAM_KEYS,
+    },
 }
 
 # ── Architecture registry ─────────────────────────────────────────────────────
+# Alpi datasets need the embedding-based variants because inputs are
+# alarm IDs (categorical) instead of floats.
 
 ARCHITECTURES = {
     "LSTM": LSTM_MultiLabel,
     "MLP":  MLP_MultiLabel,
     "CNN":  CNN_MultiLabel,
     "Transformer": Transformer_MultiLabel,
+}
+
+ALPI_ARCHITECTURES = {
+    "LSTM": AlpiLSTM,
+    "MLP":  AlpiMLP,
+    "CNN":  AlpiCNN,
+    "Transformer": AlpiTransformer,
 }
 
 
@@ -120,7 +141,9 @@ def coerce_types(cfg: dict) -> dict:
     """Coerce config values to proper Python types after JSON round-trip."""
     float_keys = {"lr", "dropout"}
     int_keys   = {"past_history", "window_size", "hidden_dim", "num_layers",
-                  "output_dim", "seed", "epochs"}
+                  "output_dim", "seed", "epochs",
+                  "embedding_dim", "num_alarms",
+                  "machine", "input_win", "output_win", "delta", "sigma", "min_count"}
     bool_keys  = {"bidirectional"}
     out = {}
     for k, v in cfg.items():
@@ -167,13 +190,24 @@ def run(exp_id: str, exp_name: str, config: dict, results_dir: Path,
     # ── Dataset ──────────────────────────────────────────────────────────────
     dataset_name = model_cfg.get("dataset", "ai4i")
     ds_info      = DATASETS[dataset_name]
-    label_names  = ds_info["label_names"]
-    # Allow config to override output_dim; default from dataset
-    output_dim   = model_cfg.get("output_dim", ds_info["output_dim"])
+
+    if ds_info.get("dynamic"):
+        ds_kwargs = {k: model_cfg[k] for k in ds_info["param_keys"] if k in model_cfg}
+        stream = ds_info["cls"](**ds_kwargs)
+        # Pandas may load label columns as non-strings; river expects str names.
+        stream.Y.columns = stream.Y.columns.astype(str)
+        label_names = list(stream.Y.columns)
+        output_dim  = model_cfg.get("output_dim", len(label_names))
+    else:
+        ds_kwargs   = {}
+        stream      = ds_info["cls"]()
+        label_names = ds_info["label_names"]
+        output_dim  = model_cfg.get("output_dim", ds_info["output_dim"])
 
     # ── Architecture ─────────────────────────────────────────────────────────
     arch_name = model_cfg.get("architecture", "LSTM")
-    module_cls = ARCHITECTURES[arch_name]
+    arch_table = ALPI_ARCHITECTURES if dataset_name == "alpi" else ARCHITECTURES
+    module_cls = arch_table[arch_name]
 
     # ── Optimizer ─────────────────────────────────────────────────────────────
     optimizer_fn = model_cfg.get("optimizer", "adam")
@@ -181,10 +215,9 @@ def run(exp_id: str, exp_name: str, config: dict, results_dir: Path,
     # ── Loss ─────────────────────────────────────────────────────────────────
     loss_fn = build_loss(loss_cfg)
 
-    kwargs_for_clf = {
-        k: v for k, v in model_cfg.items() 
-        if k not in ["dataset", "architecture", "optimizer", "output_dim", "device"]
-    }
+    excluded_keys = {"dataset", "architecture", "optimizer", "output_dim", "device"}
+    excluded_keys.update(ds_kwargs.keys())
+    kwargs_for_clf = {k: v for k, v in model_cfg.items() if k not in excluded_keys}
 
     clf = RollingMultiLabelClassifierSequences(
         module=module_cls,
@@ -196,9 +229,13 @@ def run(exp_id: str, exp_name: str, config: dict, results_dir: Path,
         **kwargs_for_clf
     )
 
-    pr = SelectType(numbers.Number) | preprocessing.StandardScaler()
-    pr += SelectType(str) | preprocessing.OneHotEncoder()
-    pipeline = pr | clf
+    if dataset_name == "alpi":
+        # Alarm IDs are categorical: skip StandardScaler/OneHotEncoder.
+        pipeline = SelectType(numbers.Number) | clf
+    else:
+        pr = SelectType(numbers.Number) | preprocessing.StandardScaler()
+        pr += SelectType(str) | preprocessing.OneHotEncoder()
+        pipeline = pr | clf
 
     all_metrics = build_metrics()
     checkpoint_rows = []
@@ -206,7 +243,7 @@ def run(exp_id: str, exp_name: str, config: dict, results_dir: Path,
 
     # ── Evaluation ───────────────────────────────────────────────────────────
     for cp in _evaluate.iter_progressive_val_score(
-        dataset=ds_info["cls"](),
+        dataset=stream,
         model=pipeline,
         metric=all_metrics,
         step=checkpoint_every,

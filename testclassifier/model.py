@@ -487,181 +487,206 @@ class Transformer_MultiLabel(nn.Module):
 
 #%%
 # ==========================
-# 5. Modelo LSTM Multi-Label para ALPI
+# 5. Modelos Multi-Label para ALPI (alarm IDs categóricos)
 # ==========================
-class AlpiEmbeddingLSTM(nn.Module):
+# Variantes de los modelos *_MultiLabel adaptadas al dataset ALPI:
+# entrada de IDs enteros de alarma (vocabulario discreto) en lugar de
+# floats. Siguen el patrón de OnlineLSTM:
+#   - nn.Embedding(num_alarms, embedding_dim, padding_idx=0) al frente
+#   - forward acepta (batch, seq), (batch, 1, seq) y (batch, ph, seq);
+#     en este último caso aplana past_history × seq_len en una única
+#     secuencia de tokens
+#   - x.long().clamp(0, num_alarms - 1) defiende contra IDs fuera de rango
+# El resto de la arquitectura mantiene la riqueza de las clases _MultiLabel
+# (num_layers, bidirectional, dropout, normalization).
+
+
+def _alpi_prepare_ids(x, num_alarms):
+    """Aplana (batch, ph, seq) a (batch, ph*seq), castea a long y satura al vocabulario."""
+    if x.dim() == 3:
+        x = x.reshape(x.size(0), -1)
+    return x.long().clamp(0, num_alarms - 1)
+
+
+class AlpiLSTM(nn.Module):
     """
-    LSTM diseñado específicamente para el dataset ALPI:
-    - Usa Embedding para tratar los IDs de alarmas como categorías.
-    - Maneja la secuencia temporal de alarmas.
+    LSTM para secuencias de alarm IDs (ALPI).
+
+    Misma arquitectura que LSTM_MultiLabel pero con un Embedding al frente
+    en vez de tomar floats: convierte cada ID de alarma en un vector
+    aprendido antes del LSTM.
     """
-    def __init__(self, input_dim, hidden_dim, output_dim, 
-                 num_alarms=256, embedding_dim=32, 
-                 num_layers=2, dropout=0.3, bidirectional=True, **kwargs):
-        """
-        Args:
-            input_dim: Ignorado (se usa num_alarms para el embedding)
-            hidden_dim: Dimensión oculta del LSTM
-            output_dim: Número de etiquetas de salida
-            num_alarms: Rango máximo de IDs de alarmas (default 256)
-            embedding_dim: Tamaño del vector de embedding
-        """
+    def __init__(self, hidden_dim, output_dim,
+                 num_alarms=155, embedding_dim=32,
+                 num_layers=2, dropout=0.3, bidirectional=True,
+                 normalization="none", **kwargs):
         super().__init__()
-        
-        # padding_idx=0 permite que la red ignore los ceros de relleno
+        self.num_alarms = num_alarms
+        self.bidirectional = bidirectional
+        self.normalization = str(normalization).lower()
+
         self.embedding = nn.Embedding(num_alarms, embedding_dim, padding_idx=0)
-        
         self.lstm = nn.LSTM(
             embedding_dim, hidden_dim, num_layers,
             batch_first=True,
             dropout=dropout if num_layers > 1 else 0,
-            bidirectional=bidirectional
+            bidirectional=bidirectional,
         )
-        
         self.dropout = nn.Dropout(dropout)
         direction_factor = 2 if bidirectional else 1
+
+        if self.normalization == "layernorm":
+            self.norm = nn.LayerNorm(hidden_dim * direction_factor)
+        elif self.normalization == "batchnorm":
+            self.norm = SafeBatchNorm1d(hidden_dim * direction_factor)
+        else:
+            self.norm = nn.Identity()
+
         self.fc = nn.Linear(hidden_dim * direction_factor, output_dim)
-        
+
     def forward(self, x):
-        """
-            x: (batch, 1, n_features) o (batch, n_features)
-        """
-        if x.dim() == 3 and x.size(1) == 1:
-            x = x.squeeze(1)
-        
-        x = x.long()
+        x = _alpi_prepare_ids(x, self.num_alarms)
         embedded = self.embedding(x)
-        
         _, (hn, _) = self.lstm(embedded)
-        
-        if self.lstm.bidirectional:
+        if self.bidirectional:
             last_hidden = torch.cat((hn[-2], hn[-1]), dim=1)
         else:
             last_hidden = hn[-1]
-            
+        last_hidden = self.norm(last_hidden)
         last_hidden = self.dropout(last_hidden)
-        logits = self.fc(last_hidden)
-        return logits
+        return self.fc(last_hidden)
 
-class StatefulAlpiEmbeddingLSTM(AlpiEmbeddingLSTM):
-    """
-    Version Stateful de AlpiEmbeddingLSTM.
-    Acepta hidden state (hx) en forward y retorna (logits, (hn, cn)).
-    """
-    def forward(self, x, hx=None):
-        if x.dim() == 3 and x.size(1) == 1:
-            x = x.squeeze(1)
-        
-        x = x.long()
-        embedded = self.embedding(x)
-        
-        output, (hn, cn) = self.lstm(embedded, hx)
-        
-        if self.lstm.bidirectional:
-            last_hidden = torch.cat((hn[-2], hn[-1]), dim=1)
-        else:
-            last_hidden = hn[-1]
-            
-        last_hidden = self.dropout(last_hidden)
-        logits = self.fc(last_hidden)
-        
-        return logits, (hn, cn)
 
-class AlpiOneHotLSTM(nn.Module):
+class AlpiMLP(nn.Module):
     """
-    LSTM que utiliza One-Hot encoding en lugar de Embeddings.
+    MLP para secuencias de alarm IDs (ALPI).
+
+    Embedding al frente; los embeddings de toda la secuencia se aplanan
+    y pasan por un stack de capas densas. La primera capa es LazyLinear
+    porque la longitud total (past_history × seq_len) se descubre en runtime.
     """
-    def __init__(self, input_dim, hidden_dim, output_dim, 
-                 num_alarms=256,
-                 num_layers=2, dropout=0.3, bidirectional=True, **kwargs):
+    def __init__(self, output_dim,
+                 num_alarms=155, embedding_dim=32,
+                 hidden_dims=None, hidden_dim=64, num_layers=2,
+                 dropout=0.3, normalization="none",
+                 past_history=1, **kwargs):
         super().__init__()
         self.num_alarms = num_alarms
-        
-        # En One-Hot, el input_dim del LSTM es el número de posibles alarmas
-        self.lstm = nn.LSTM(
-            num_alarms, hidden_dim, num_layers,
-            batch_first=True,
-            dropout=dropout if num_layers > 1 else 0,
-            bidirectional=bidirectional
-        )
-        
-        self.dropout = nn.Dropout(dropout)
-        direction_factor = 2 if bidirectional else 1
-        self.fc = nn.Linear(hidden_dim * direction_factor, output_dim)
-
-    def forward(self, x):
-        if x.dim() == 3 and x.size(1) == 1:
-            x = x.squeeze(1)
-        
-        x = x.long()
-        # Convertimos a One-Hot: (batch, seq_len, num_alarms)
-        encoded = F.one_hot(x, num_classes=self.num_alarms).float()
-        
-        _, (hn, _) = self.lstm(encoded)
-        
-        if self.lstm.bidirectional:
-            last_hidden = torch.cat((hn[-2], hn[-1]), dim=1)
-        else:
-            last_hidden = hn[-1]
-            
-        last_hidden = self.dropout(last_hidden)
-        logits = self.fc(last_hidden)
-        return logits
-
-# ==========================
-# 10. AlpiEmbeddingCNN (1D CNN for Alarm Sequences)
-# ==========================
-
-
-class AlpiEmbeddingMLP(nn.Module):
-    """
-    MLP que usa Global Average Pooling sobre la secuencia de embeddings.
-    Es un 'Deep Averaging Network' (DAN), robusto a la longitud de la secuencia.
-    """
-    def __init__(self, input_dim, hidden_dim, output_dim,
-                 num_alarms=256, embedding_dim=32,
-                 maxlen=100, dropout=0.3, **kwargs):
-        super().__init__()
-        
         self.embedding = nn.Embedding(num_alarms, embedding_dim, padding_idx=0)
-        
-        # Usamos Global Average Pooling -> Entrada al MLP es embedding_dim
-        # Esto hace al modelo invariante a la longitud de secuencia (maxlen se ignora)
-        self.pool = nn.AdaptiveAvgPool1d(1)
-        
-        self.fc1 = nn.Linear(embedding_dim, hidden_dim)
-        self.relu = nn.ReLU()
-        self.dropout = nn.Dropout(dropout)
-        
-        self.fc2 = nn.Linear(hidden_dim, output_dim)
-        
-    def forward(self, x):
-        if x.dim() == 3 and x.size(1) == 1:
-            x = x.squeeze(1)
-            
-        x = x.long()
-        # (batch, seq_len, embed_dim)
-        embedded = self.embedding(x)
-        
-        # Permutar para Pooling: (batch, embed_dim, seq_len)
-        embedded = embedded.permute(0, 2, 1)
-        
-        # Global Avg Pool: (batch, embed_dim, 1)
-        pooled = self.pool(embedded)
-        
-        # Flatten: (batch, embed_dim)
-        x = pooled.squeeze(-1)
-        
-        x = self.fc1(x)
-        x = self.relu(x)
-        x = self.dropout(x)
-        logits = self.fc2(x)
-        
-        return logits
 
-# ==========================
-# 13. AlpiEmbeddingGRU (REC Variant)
-# ==========================
+        if hidden_dims is None:
+            hidden_dims = [hidden_dim] * num_layers
+
+        norm_type = str(normalization).lower()
+        layers = []
+        prev_dim = None
+        for i, hd in enumerate(hidden_dims):
+            if i == 0:
+                layers.append(nn.LazyLinear(hd))
+            else:
+                layers.append(nn.Linear(prev_dim, hd))
+            if norm_type == "layernorm":
+                layers.append(nn.LayerNorm(hd))
+            elif norm_type == "batchnorm":
+                layers.append(SafeBatchNorm1d(hd))
+            layers.append(nn.ReLU())
+            layers.append(nn.Dropout(dropout))
+            prev_dim = hd
+        layers.append(nn.Linear(prev_dim, output_dim))
+        self.network = nn.Sequential(*layers)
+
+    def forward(self, x):
+        x = _alpi_prepare_ids(x, self.num_alarms)
+        embedded = self.embedding(x)
+        flat = embedded.reshape(embedded.size(0), -1)
+        return self.network(flat)
+
+
+class AlpiCNN(nn.Module):
+    """
+    CNN 1D para secuencias de alarm IDs (ALPI).
+
+    Embedding al frente; se aplica Conv1d sobre la dimensión temporal usando
+    embedding_dim como número de canales de entrada. Global max pooling al
+    final, igual que CNN_MultiLabel.
+    """
+    def __init__(self, hidden_dim, output_dim,
+                 num_alarms=155, embedding_dim=32,
+                 num_layers=2, dropout=0.3, normalization="none", **kwargs):
+        super().__init__()
+        self.num_alarms = num_alarms
+        self.embedding = nn.Embedding(num_alarms, embedding_dim, padding_idx=0)
+
+        norm_type = str(normalization).lower()
+        layers = []
+        in_channels = embedding_dim
+        for _ in range(num_layers):
+            layers.append(nn.Conv1d(in_channels, hidden_dim, kernel_size=3, padding=1))
+            if norm_type == "layernorm":
+                layers.append(nn.GroupNorm(1, hidden_dim))
+            elif norm_type == "batchnorm":
+                layers.append(SafeBatchNorm1d(hidden_dim))
+            layers.append(nn.ReLU())
+            layers.append(nn.Dropout(dropout))
+            in_channels = hidden_dim
+        self.conv = nn.Sequential(*layers)
+        self.fc = nn.Linear(hidden_dim, output_dim)
+
+    def forward(self, x):
+        x = _alpi_prepare_ids(x, self.num_alarms)
+        embedded = self.embedding(x)            # (batch, total_seq, emb_dim)
+        embedded = embedded.transpose(1, 2)     # (batch, emb_dim, total_seq)
+        out = self.conv(embedded)
+        out = torch.max(out, dim=2)[0]
+        return self.fc(out)
+
+
+class AlpiTransformer(nn.Module):
+    """
+    Transformer Encoder para secuencias de alarm IDs (ALPI).
+
+    Embedding al frente, proyección a hidden_dim, positional encoding y
+    encoder estándar de PyTorch. Mean/max pooling sobre la dimensión temporal,
+    igual que Transformer_MultiLabel.
+    """
+    def __init__(self, hidden_dim, output_dim,
+                 num_alarms=155, embedding_dim=32,
+                 num_layers=2, dropout=0.3, normalization="layernorm", **kwargs):
+        super().__init__()
+        self.num_alarms = num_alarms
+        self.embedding = nn.Embedding(num_alarms, embedding_dim, padding_idx=0)
+        self.proj = nn.Linear(embedding_dim, hidden_dim)
+        self.pos_encoder = PositionalEncoding(hidden_dim)
+
+        norm_type = str(normalization).lower()
+        if norm_type == "batchnorm":
+            self.norm = SafeBatchNorm1d(hidden_dim)
+        elif norm_type == "layernorm":
+            self.norm = nn.LayerNorm(hidden_dim)
+        else:
+            self.norm = nn.Identity()
+
+        nhead = 4
+        while hidden_dim % nhead != 0 and nhead > 1:
+            nhead -= 1
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=hidden_dim, nhead=nhead, dim_feedforward=hidden_dim * 2,
+            dropout=dropout, batch_first=True, norm_first=True,
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        self.fc = nn.Linear(hidden_dim, output_dim)
+
+    def forward(self, x):
+        x = _alpi_prepare_ids(x, self.num_alarms)
+        embedded = self.embedding(x)
+        out = self.proj(embedded)
+        out = self.pos_encoder(out)
+        out = self.transformer(out)
+        out = torch.max(out, dim=1)[0]
+        out = self.norm(out)
+        return self.fc(out)
+
+
 class BidirectionalAdaptiveFocalLoss(nn.Module):
     """
     Bidirectional Adaptive Focal Loss.

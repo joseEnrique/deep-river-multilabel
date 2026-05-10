@@ -1,0 +1,155 @@
+# ── Agent identity & backend ─────────────────────────────────────────────────
+backend_url: http://localhost:8080
+api_key:     null        # null → reads $BACKEND_API_KEY (or no auth if backend has none)
+agent_id:    null        # null → uses socket.gethostname()
+dataset:     alpi        # backend will use DB experiments_alpi
+
+# GPUs this agent owns. One dispatcher thread per device.
+devices:
+  - cuda:0
+  - cuda:1
+
+# Slots per GPU (concurrencia). Tres tiers según compute_score
+# (ws · hd² · nl, ×1.5 si LSTM, + ws² · hd · nl si Transformer):
+#   SMALL  (1 slot,  ~25% GPU): score ≤ 1.5M
+#   MEDIUM (2 slots, ~50% GPU): 1.5M < score ≤ 6.8M
+#   LARGE  (4 slots, 100% GPU): score > 6.8M
+# Default 4 slots/GPU → caben 4 SMALL, ó 2 MEDIUM, ó 1 LARGE, ó 1 MEDIUM + 2 SMALL.
+max_slots_per_device: 4
+
+# Override opcional por device (útil si una GPU tiene menos VRAM):
+# slots_per_device:
+#   cuda:0: 4
+#   cuda:1: 2
+
+
+# If true (default), each dispatcher claims ANY pending experiment from the
+# dataset (even if registered by another agent). The `device` field on a
+# registered config is used as a SOFT preference for routing, never a hard
+# filter. Set to false to restrict this agent to experiments it registered.
+consume_any: true
+
+# Local SQLite mirror — every state change (register, claim, checkpoint,
+# finish, fail) is also written here. Acts as an offline log if the backend
+# is unavailable. Defaults to ./local_<dataset>.db
+local_db_path: null
+
+checkpoint_every: 1000
+poll_interval: 5         # seconds between empty-poll cycles
+
+# ── Experiment grid (optional) ───────────────────────────────────────────────
+# ALPI: el dataset toma alarm IDs categóricos (vocabulario de 154 alarmas + padding).
+# El runner_adapter detecta dataset=alpi y:
+#   - instancia NewAlpi(machine, input_win, output_win, delta, sigma, min_count)
+#   - despacha LSTM→AlpiLSTM, MLP→AlpiMLP, CNN→AlpiCNN, Transformer→AlpiTransformer
+#     (variantes con nn.Embedding al frente, en lugar de las *_MultiLabel basadas en floats)
+#   - usa pipeline solo con SelectType(numbers.Number) (sin StandardScaler/OneHotEncoder)
+#
+# Los parámetros del dataset (machine, input_win, output_win, delta, sigma, min_count)
+# y los del embedding (embedding_dim, num_alarms) viajan dentro del config y
+# quedan codificados en el exp_name para no colisionar entre máquinas/ventanas.
+
+model:
+  # ── LSTM (ALPI)
+  - architecture:  [LSTM]
+    device:        ["cuda:1"]
+    optimizer:     [adam]
+    # Dataset
+    machine:       [4]
+    input_win:     [1720]
+    output_win:    [480]
+    delta:         [0]
+    sigma:         [120]
+    min_count:     [0]
+    # Embedding
+    num_alarms:    [155]
+    embedding_dim: [8, 32]
+    # Sequencer / clasificador
+    past_history:  [1, 2, 5]
+    window_size:   [1, 50, 200, 500]
+    # Arquitectura
+    hidden_dim:    [64, 128]
+    num_layers:    [1, 2]
+    lr:            [0.01, 0.001]
+    dropout:       [0.2, 0]
+    bidirectional: [false]
+    normalization: ["none", "layernorm"]
+    seed:          [42]
+    epochs:        [1, 3]
+
+  # ── MLP (ALPI) — primera capa LazyLinear, autoajusta a ph × seq_len × emb_dim
+  - architecture:  [MLP]
+    device:        ["cuda:1"]
+    optimizer:     [adam]
+    machine:       [4]
+    input_win:     [1720]
+    output_win:    [480]
+    delta:         [0]
+    sigma:         [120]
+    min_count:     [0]
+    num_alarms:    [155]
+    embedding_dim: [8, 32]
+    past_history:  [1, 2, 5]
+    window_size:   [1, 50, 200, 500]
+    hidden_dims:   [[128, 64, 32], [128, 64], [64, 32]]
+    lr:            [0.01, 0.001, 0.0001]
+    dropout:       [0.2, 0]
+    normalization: ["none", "layernorm"]
+    seed:          [42]
+    epochs:        [1, 3]
+
+  # ── CNN (ALPI)
+  - architecture:  [CNN]
+    device:        ["cuda:1"]
+    optimizer:     [adam]
+    machine:       [4]
+    input_win:     [1720]
+    output_win:    [480]
+    delta:         [0]
+    sigma:         [120]
+    min_count:     [0]
+    num_alarms:    [155]
+    embedding_dim: [8, 32]
+    past_history:  [1, 2, 5]
+    window_size:   [1, 50, 200, 500]
+    hidden_dim:    [64, 128]
+    num_layers:    [1, 2]
+    lr:            [0.01, 0.001, 0.0001]
+    dropout:       [0.2, 0]
+    normalization: ["none", "layernorm"]
+    seed:          [42]
+    epochs:        [1, 3]
+
+  # ── Transformer (ALPI)
+  - architecture:  [Transformer]
+    device:        ["cuda:0"]
+    optimizer:     [adam]
+    machine:       [4]
+    input_win:     [1720]
+    output_win:    [480]
+    delta:         [0]
+    sigma:         [120]
+    min_count:     [0]
+    num_alarms:    [155]
+    embedding_dim: [8, 32]
+    past_history:  [1, 2, 5]
+    window_size:   [1, 50, 200, 500]
+    hidden_dim:    [32, 64, 128]
+    num_layers:    [1, 2]
+    lr:            [0.01, 0.001, 0.0001]
+    dropout:       [0.2, 0]
+    normalization: ["none", "layernorm"]
+    seed:          [42]
+    epochs:        [1, 3]
+
+loss:
+  - type: BCE
+  - type: StaticFocal
+    alpha: 0.25
+    gamma: 2.0
+  - type: AdaptiveFocal
+    base_gamma: 2.0
+    base_alpha: 0.25
+    decay: 0.999
+    alpha_gain: 1.0
+    gamma_gain: 2.0
