@@ -276,9 +276,11 @@ def worker_main(device: str, agent_id: str, dataset: str, base_url: str,
                 with cond:
                     if slots_needed > available_slots:
                         continue  # no cabe ahora; intenta el siguiente
-                    # Regla SIEMPRE: máx (max_slots - 1) SMALL en la GPU
-                    # (ej. 3 SMALL en 4 slots, 2 SMALL en 3 slots, etc.).
-                    if slots_needed == 1 and smalls_running >= max(1, max_slots - 1):
+                    # Regla SIEMPRE: máximo 3 SMALL concurrentes en la GPU,
+                    # sea cual sea max_slots. En 4 slots quedaría 1 libre,
+                    # en 3 slots se satura, en 2 slots el límite físico (2)
+                    # ya manda y este check no aplica.
+                    if slots_needed == 1 and smalls_running >= 3:
                         continue
                     # Reglas SOLO cuando el que entra es Transformer:
                     #   - 2 MEDIUM Transformer (saturan al 100%, OK)
