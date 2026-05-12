@@ -214,24 +214,33 @@ def worker_main(device: str, agent_id: str, dataset: str, base_url: str,
 
     available_slots = max_slots
     # Contadores:
-    # - smalls_running: cualquier arch en tier SMALL. Tope = max_slots - 1.
-    #   (en una GPU de 4 slots no se permite el 4° SMALL para evitar saturación
-    #   con muchos procesos pequeños).
-    # - transformer_smalls / transformer_others: separados por tier para aplicar
-    #   reglas extra al saturar con Transformers (2 MEDIUM Tr OK, 4 SMALL Tr NO).
+    # - smalls_running: cualquier arch en tier SMALL (tope absoluto 3).
+    # - heavy_smalls_running: SMALL con past_history>=10 (secuencias largas
+    #   que consumen más memoria y compute aunque caigan en tier SMALL; tope 2).
+    # - transformer_smalls / transformer_others: por tier para reglas de
+    #   saturación con Transformer (2 MEDIUM Tr OK, 4 SMALL Tr NO).
     smalls_running = 0
+    heavy_smalls_running = 0
     transformer_smalls_running = 0
     transformer_others_running = 0
     cond = threading.Condition()
 
-    def release_cb(slots_used: int, was_transformer: bool):
+    def is_heavy_small(c: dict) -> bool:
+        try:
+            return int(c.get("past_history", 1)) >= 10
+        except (TypeError, ValueError):
+            return False
+
+    def release_cb(slots_used: int, was_transformer: bool, was_heavy_small: bool):
         def _cb(_fut):
-            nonlocal available_slots, smalls_running
+            nonlocal available_slots, smalls_running, heavy_smalls_running
             nonlocal transformer_smalls_running, transformer_others_running
             with cond:
                 available_slots += slots_used
                 if slots_used == 1:
                     smalls_running = max(0, smalls_running - 1)
+                    if was_heavy_small:
+                        heavy_smalls_running = max(0, heavy_smalls_running - 1)
                 if was_transformer:
                     if slots_used == 1:
                         transformer_smalls_running -= 1
@@ -273,14 +282,26 @@ def worker_main(device: str, agent_id: str, dataset: str, base_url: str,
                 arch = cfg.get("architecture") or cfg.get("arch") or ""
                 will_be_transformer = (arch == "Transformer")
 
+                will_be_heavy_small = (slots_needed == 1 and is_heavy_small(cfg))
+
                 with cond:
                     if slots_needed > available_slots:
                         continue  # no cabe ahora; intenta el siguiente
-                    # Regla SIEMPRE: máximo 3 SMALL concurrentes en la GPU,
-                    # sea cual sea max_slots. En 4 slots quedaría 1 libre,
-                    # en 3 slots se satura, en 2 slots el límite físico (2)
-                    # ya manda y este check no aplica.
+                    # Regla SIEMPRE: máximo 3 SMALL concurrentes en la GPU.
                     if slots_needed == 1 and smalls_running >= 3:
+                        continue
+                    # Regla EXTRA para SMALLs caros (ph>=10): máx 2.
+                    if will_be_heavy_small and heavy_smalls_running >= 2:
+                        continue
+                    # Si ya hay heavy SMALLs corriendo, no permitir que un
+                    # MEDIUM/LARGE entre y sature la GPU al 100% (los heavy
+                    # SMALL ya consumen suficiente; sumar más arriesga OOM/
+                    # throttling). Excepción: un LARGE que ocupa exactamente
+                    # toda la GPU él solo no es el caso (cabría solo si la GPU
+                    # está vacía, controlado por slots_needed > available).
+                    if (heavy_smalls_running > 0
+                            and slots_needed > 1
+                            and (available_slots - slots_needed) < 1):
                         continue
                     # Reglas SOLO cuando el que entra es Transformer:
                     #   - 2 MEDIUM Transformer (saturan al 100%, OK)
@@ -308,6 +329,8 @@ def worker_main(device: str, agent_id: str, dataset: str, base_url: str,
                     available_slots -= slots_needed
                     if slots_needed == 1:
                         smalls_running += 1
+                        if will_be_heavy_small:
+                            heavy_smalls_running += 1
                     if will_be_transformer:
                         if slots_needed == 1:
                             transformer_smalls_running += 1
@@ -319,7 +342,7 @@ def worker_main(device: str, agent_id: str, dataset: str, base_url: str,
                     name, cfg, device, dataset, base_url, agent_id,
                     api_key, checkpoint_every, local_db_path,
                 )
-                fut.add_done_callback(release_cb(slots_needed, will_be_transformer))
+                fut.add_done_callback(release_cb(slots_needed, will_be_transformer, will_be_heavy_small))
                 launched_any = True
 
                 with cond:
