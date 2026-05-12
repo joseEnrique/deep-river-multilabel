@@ -250,6 +250,9 @@ def main():
             # Base compute
             compute_score = ws * (hd ** 2) * nl
 
+            ph = max(1, int(cfg.get("past_history", 1) or 1))
+            ep = max(1, int(cfg.get("epochs", 1) or 1))
+
             # Penalizaciones
             if arch == "Transformer":
                 compute_score += (ws ** 2) * hd * nl * 0.2
@@ -257,6 +260,8 @@ def main():
                 compute_score *= 1.5
             elif arch in ("MLP", "CNN"):
                 compute_score *= 0.3   # MLP/CNN son mucho más ligeros que un LSTM equivalente
+
+            compute_score *= ph * ep   # ph y ep escalan el coste para todos
 
             # Tiers: SMALL (1 slot, ~25% GPU) / MEDIUM (2, ~50%) / LARGE (4, 100%)
             SMALL_CEILING = 1_500_000

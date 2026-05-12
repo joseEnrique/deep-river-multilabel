@@ -32,6 +32,8 @@ def get_slots_needed(cfg: dict) -> int:
         hd = max(cfg["hidden_dims"])
 
     nl = cfg.get("num_layers", 1)
+    ph = max(1, int(cfg.get("past_history", 1) or 1))
+    ep = max(1, int(cfg.get("epochs", 1) or 1))
 
     score = ws * (hd ** 2) * nl
     if arch == "Transformer":
@@ -43,6 +45,10 @@ def get_slots_needed(cfg: dict) -> int:
         score *= 1.5
     elif arch in ("MLP", "CNN"):
         score *= 0.3   # MLP/CNN son mucho más ligeros que un LSTM equivalente
+
+    # past_history y epochs aumentan el coste lineal con cada uno para todos
+    # los modelos (más timesteps por forward · más pasadas del optimizador).
+    score *= ph * ep
 
     if score <= SMALL_CEILING:
         return SMALL_SLOTS
