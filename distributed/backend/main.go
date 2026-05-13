@@ -57,6 +57,16 @@ func main() {
 		r.Post("/experiments", h.CreateExperiment)
 		r.Post("/experiments/bulk", h.BulkCreate)
 
+		r.Route("/cube", func(r chi.Router) {
+			r.Get("/metrics", h.CubeMetrics)
+			r.Get("/params", h.CubeParams)
+			r.Get("/params/values", h.CubeParamValues)
+			r.Get("/top", h.CubeTop)
+			r.Get("/groupby", h.CubeGroupBy)
+			r.Get("/best-per", h.CubeBestPer)
+			r.Get("/distribution", h.CubeDistribution)
+		})
+
 		r.Route("/experiments/{name}", func(r chi.Router) {
 			r.Get("/", h.GetExperiment)
 			r.Put("/", h.ReplaceExperiment)
