@@ -160,6 +160,58 @@ class BackendClient:
             raise BackendError(r.status_code, r.text)
         return r.json()
 
+    # ── Cube / statistical endpoints ─────────────────────────────────────
+    def _cube_get(self, *parts: str, params: dict | None = None) -> dict:
+        from urllib.parse import urlencode
+        url = self._ds_url("cube", *parts)
+        if params:
+            qs = urlencode({k: v for k, v in params.items() if v is not None and v != ""})
+            if qs:
+                url += "?" + qs
+        r = self.s.get(url, timeout=self.timeout)
+        if r.status_code != 200:
+            raise BackendError(r.status_code, r.text)
+        return r.json()
+
+    def cube_metrics(self, status: str | None = None) -> dict:
+        return self._cube_get("metrics", params={"status": status})
+
+    def cube_params(self, status: str | None = None, sample: int | None = None) -> dict:
+        return self._cube_get("params", params={"status": status, "sample": sample})
+
+    def cube_param_values(self, key: str, metric: str | None = None,
+                          where: str | None = None, status: str | None = None) -> dict:
+        return self._cube_get("params", "values",
+                              params={"key": key, "metric": metric,
+                                      "where": where, "status": status})
+
+    def cube_top(self, metric: str, limit: int = 10, order: str = "desc",
+                 where: str | None = None, status: str | None = None) -> dict:
+        return self._cube_get("top",
+                              params={"metric": metric, "limit": limit,
+                                      "order": order, "where": where, "status": status})
+
+    def cube_groupby(self, by: str, metric: str, agg: str = "max,mean,count",
+                     order: str | None = None, limit: int = 50,
+                     where: str | None = None, status: str | None = None) -> dict:
+        return self._cube_get("groupby",
+                              params={"by": by, "metric": metric, "agg": agg,
+                                      "order": order, "limit": limit,
+                                      "where": where, "status": status})
+
+    def cube_best_per(self, by: str, metric: str, order: str = "desc",
+                      limit: int = 50, where: str | None = None,
+                      status: str | None = None) -> dict:
+        return self._cube_get("best-per",
+                              params={"by": by, "metric": metric, "order": order,
+                                      "limit": limit, "where": where, "status": status})
+
+    def cube_distribution(self, metric: str, bins: int = 10,
+                          where: str | None = None, status: str | None = None) -> dict:
+        return self._cube_get("distribution",
+                              params={"metric": metric, "bins": bins,
+                                      "where": where, "status": status})
+
     def download_results_csv(self, out_path: str, **filters) -> str:
         """Download the per-dataset CSV results file. `filters` are passed as
         query params (status, architecture, agent_id, device, loss_type,

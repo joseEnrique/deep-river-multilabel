@@ -355,6 +355,152 @@ def worker_main(device: str, agent_id: str, dataset: str, base_url: str,
                 time.sleep(poll_interval)
 
 
+# ── Cube queries (CLI helpers) ────────────────────────────────────────────────
+
+def _fmt_num(v, ndigits: int = 4) -> str:
+    if v is None:
+        return "-"
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return str(v)
+    return f"{f:.{ndigits}f}"
+
+
+def _print_top(resp: dict, metric: str):
+    metric_path = metric if metric.startswith("final_metrics.") else f"final_metrics.{metric}"
+    metric_key = metric_path.split(".", 1)[1]
+    exps = resp.get("experiments") or []
+    print(f"[top] dataset={resp.get('dataset')} metric={metric} count={len(exps)}")
+    print(f"  {'#':>3}  {metric_key:>12}  {'ARCH':<12} {'STATUS':<8}  EXP_NAME")
+    for i, e in enumerate(exps, 1):
+        fm = e.get("final_metrics") or {}
+        val = _fmt_num(fm.get(metric_key))
+        print(f"  {i:>3}  {val:>12}  {(e.get('architecture') or '-'):<12} "
+              f"{(e.get('status') or '-'):<8}  {e.get('exp_name')}")
+
+
+def _print_groupby(resp: dict):
+    groups = resp.get("groups") or []
+    aggs = resp.get("agg") or []
+    keys = resp.get("by") or []
+    print(f"[groupby] dataset={resp.get('dataset')} metric={resp.get('metric')} "
+          f"by={','.join(keys)} order={resp.get('order')} count={len(groups)}")
+    header = "  " + "  ".join(f"{k:<14}" for k in keys) + "  " + "  ".join(
+        f"{a:>10}" for a in aggs)
+    print(header)
+    for g in groups:
+        grp = g.get("group") or {}
+        mtr = g.get("metrics") or {}
+        cells = [f"{str(grp.get(k, '-')):<14}" for k in keys]
+        vals = []
+        for a in aggs:
+            name = {"avg": "mean", "stddev": "std"}.get(a, a)
+            vals.append(f"{_fmt_num(mtr.get(name)):>10}")
+        print("  " + "  ".join(cells) + "  " + "  ".join(vals))
+
+
+def _print_best_per(resp: dict):
+    metric = resp.get("metric") or ""
+    metric_key = metric.split(".")[-1] if metric else ""
+    groups = resp.get("groups") or []
+    print(f"[best-per] dataset={resp.get('dataset')} by={resp.get('by')} "
+          f"metric={metric} count={len(groups)}")
+    print(f"  {'VALUE':<24} {'COUNT':>6}  {metric_key:>12}  EXP_NAME")
+    for g in groups:
+        val = g.get("value")
+        count = g.get("count")
+        best = g.get("best") or {}
+        fm = best.get("final_metrics") or {}
+        m = _fmt_num(fm.get(metric_key))
+        print(f"  {str(val):<24} {str(count):>6}  {m:>12}  {best.get('exp_name', '-')}")
+
+
+def _print_distribution(resp: dict):
+    bins = resp.get("bins") or []
+    if not bins:
+        print(f"[distribution] no data")
+        return
+    max_count = max((b.get("count") or 0) for b in bins) or 1
+    print(f"[distribution] metric={resp.get('metric')} count={resp.get('count')} "
+          f"min={_fmt_num(resp.get('min'))} max={_fmt_num(resp.get('max'))} "
+          f"mean={_fmt_num(resp.get('mean'))} std={_fmt_num(resp.get('std'))}")
+    for b in bins:
+        lo, hi, c = b.get("lo"), b.get("hi"), b.get("count") or 0
+        bar = "█" * int(40 * c / max_count)
+        print(f"  [{_fmt_num(lo)}, {_fmt_num(hi)})  {c:>6}  {bar}")
+
+
+def _maybe_run_cube_query(client, args) -> bool:
+    """Dispatch a cube subcommand if requested. Returns True if handled."""
+    triggers = [
+        args.cube_metrics, args.cube_params, args.cube_param_values,
+        args.cube_top, args.cube_groupby, args.cube_best_per,
+        args.cube_distribution,
+    ]
+    if not any(triggers):
+        return False
+
+    if args.cube_metrics:
+        print(json.dumps(client.cube_metrics(status=args.cube_status), indent=2))
+        return True
+
+    if args.cube_params:
+        print(json.dumps(client.cube_params(status=args.cube_status), indent=2))
+        return True
+
+    if args.cube_param_values:
+        resp = client.cube_param_values(
+            key=args.cube_param_values, metric=args.metric,
+            where=args.where, status=args.cube_status)
+        print(json.dumps(resp, indent=2))
+        return True
+
+    if args.cube_top:
+        if not args.metric:
+            print("error: --cube-top requires --metric", file=sys.stderr)
+            sys.exit(2)
+        order = args.order or "desc"
+        resp = client.cube_top(metric=args.metric, limit=args.limit, order=order,
+                               where=args.where, status=args.cube_status)
+        _print_top(resp, args.metric)
+        return True
+
+    if args.cube_groupby:
+        if not args.metric:
+            print("error: --cube-groupby requires --metric", file=sys.stderr)
+            sys.exit(2)
+        resp = client.cube_groupby(
+            by=args.cube_groupby, metric=args.metric, agg=args.agg,
+            order=args.order, limit=args.limit, where=args.where,
+            status=args.cube_status)
+        _print_groupby(resp)
+        return True
+
+    if args.cube_best_per:
+        if not args.metric:
+            print("error: --cube-best-per requires --metric", file=sys.stderr)
+            sys.exit(2)
+        order = args.order or "desc"
+        resp = client.cube_best_per(
+            by=args.cube_best_per, metric=args.metric, order=order,
+            limit=args.limit, where=args.where, status=args.cube_status)
+        _print_best_per(resp)
+        return True
+
+    if args.cube_distribution:
+        if not args.metric:
+            print("error: --cube-distribution requires --metric", file=sys.stderr)
+            sys.exit(2)
+        resp = client.cube_distribution(
+            metric=args.metric, bins=args.bins, where=args.where,
+            status=args.cube_status)
+        _print_distribution(resp)
+        return True
+
+    return False
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
@@ -370,6 +516,37 @@ def main():
                     help="Skip the bulk register step.")
     ap.add_argument("--consume-only", action="store_true",
                     help="Same as --no-register; clearer name for worker-only agents.")
+
+    # Cube / statistical queries (read-only, all GET).
+    cg = ap.add_argument_group("cube queries (read-only)")
+    cg.add_argument("--cube-metrics", action="store_true",
+                    help="List metric names found in final_metrics.")
+    cg.add_argument("--cube-params", action="store_true",
+                    help="List config keys discovered across experiments.")
+    cg.add_argument("--cube-param-values", metavar="KEY",
+                    help="Distinct values of KEY (with optional --metric).")
+    cg.add_argument("--cube-top", action="store_true",
+                    help="Top-N experiments by --metric.")
+    cg.add_argument("--cube-groupby", metavar="KEYS",
+                    help="Group by comma-separated keys; needs --metric.")
+    cg.add_argument("--cube-best-per", metavar="KEY",
+                    help="Best experiment per value of KEY (needs --metric).")
+    cg.add_argument("--cube-distribution", action="store_true",
+                    help="Histogram of --metric.")
+    cg.add_argument("--metric", default=None,
+                    help="Metric name for cube queries (e.g. exact_match).")
+    cg.add_argument("--agg", default="max,mean,count",
+                    help="Aggregations for --cube-groupby (default: max,mean,count).")
+    cg.add_argument("--order", default=None,
+                    help="Sort spec, e.g. 'max:desc' for groupby, 'desc' elsewhere.")
+    cg.add_argument("--limit", type=int, default=10,
+                    help="Limit for cube queries (default: 10).")
+    cg.add_argument("--bins", type=int, default=10,
+                    help="Bin count for --cube-distribution (default: 10).")
+    cg.add_argument("--where", default=None,
+                    help="Equality filter 'k=v,k2=v2' applied to the query.")
+    cg.add_argument("--cube-status", default=None,
+                    help="Status filter for cube queries ('done' default, 'all' to disable).")
     args = ap.parse_args()
 
     cfg = load_yaml(args.config)
@@ -490,6 +667,9 @@ def main():
                 el = fmt_eta(r.get("elapsed_s") or 0.0)
                 name = r.get("exp_name", "?")
                 print(f"  {label:<7} {arch:<12} {ag:<24} {dev:<10} {el:>10}  {name}")
+        return
+
+    if _maybe_run_cube_query(client, args):
         return
 
     grid = build_grid(cfg)
