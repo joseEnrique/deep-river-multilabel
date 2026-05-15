@@ -198,7 +198,7 @@ def worker_main(device: str, agent_id: str, dataset: str, base_url: str,
                 api_key: str | None,
                 max_slots: int) -> None:
     """Despachador con slots: hasta `max_slots` experimentos concurrentes en `device`.
-    LIGHT=1 slot, HEAVY=2 slots (slots.get_slots_needed). Calcado del scheduler local."""
+    SMALL/MEDIUM=2 slots, LARGE=4 slots (slots.get_slots_needed). Calcado del scheduler local."""
     import threading
     import concurrent.futures
     from slots import get_slots_needed

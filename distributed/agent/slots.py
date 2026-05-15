@@ -1,21 +1,21 @@
 """
 Slot accounting per GPU — tres tiers (SMALL/MEDIUM/LARGE).
 
-Cada GPU expone un número de slots (capacidad de concurrencia) y cada
-experimento consume 1 (SMALL ~25% GPU), 2 (MEDIUM ~50%) o 4 (LARGE 100%)
-según `compute_score`. Esto permite, p.ej., 4 SMALL en paralelo en la
-misma GPU, o 1 MEDIUM + 2 SMALL.
+Cada GPU expone 4 slots y cada experimento consume 2 (SMALL ~50% GPU),
+2 (MEDIUM ~50%) o 4 (LARGE 100%) según `compute_score`. Esto permite,
+en una GPU de 4 slots, hasta 2 SMALL, 2 MEDIUM o 1 LARGE en paralelo
+(válido para MLP, LSTM y CNN — misma fórmula de coste).
 """
 
-# Boundary scores (compute_score = ws · hd² · nl, ×1.5 si LSTM,
-# + ws² · hd · nl si Transformer, ×0.3 si MLP/CNN).
-SMALL_CEILING = 1_500_000    # ≤ → SMALL (1 slot)
+# Boundary scores. Misma fórmula para todas las arquitecturas (MLP/LSTM/CNN):
+#   compute_score = (ws · hd² · nl + ws² · hd · nl · 0.2) · ph · ep
+SMALL_CEILING = 1_500_000    # ≤ → SMALL (2 slots)
 MEDIUM_CEILING = 30_000_000  # ≤ → MEDIUM (2 slots), > → LARGE (4 slots)
 
 # Default si el config del agent no define `max_slots_per_device`.
 DEFAULT_MAX_SLOTS_PER_GPU = 4
 
-SMALL_SLOTS = 1
+SMALL_SLOTS = 2
 MEDIUM_SLOTS = 2
 LARGE_SLOTS = 4
 
@@ -36,15 +36,9 @@ def get_slots_needed(cfg: dict) -> int:
     ep = max(1, int(cfg.get("epochs", 1) or 1))
 
     score = ws * (hd ** 2) * nl
-    if arch == "Transformer":
-        # Self-attention escala O(ws²) en FLOPs, pero las RTX 3090 paralelizan
-        # bien matmuls grandes y el % real de GPU usado es bastante menor que
-        # lo que sugeriría el conteo teórico → factor 0.2.
-        score += (ws ** 2) * hd * nl * 0.2
-    elif arch == "LSTM":
-        score *= 1.5
-    elif arch in ("MLP", "CNN"):
-        score *= 0.3   # MLP/CNN son mucho más ligeros que un LSTM equivalente
+    # Mismo perfil de coste para todas las arquitecturas: término cuadrático
+    # en ws con factor 0.2 (las RTX 3090 paralelizan bien matmuls grandes).
+    score += (ws ** 2) * hd * nl * 0.2
 
     # past_history y epochs aumentan el coste lineal con cada uno para todos
     # los modelos (más timesteps por forward · más pasadas del optimizador).
