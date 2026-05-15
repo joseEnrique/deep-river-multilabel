@@ -10,11 +10,11 @@ devices:
   - cuda:1
 
 # Slots per GPU (concurrencia). Tres tiers según compute_score
-# (ws · hd² · nl, ×1.5 si LSTM, + ws² · hd · nl si Transformer):
-#   SMALL  (1 slot,  ~25% GPU): score ≤ 1.5M
-#   MEDIUM (2 slots, ~50% GPU): 1.5M < score ≤ 6.8M
-#   LARGE  (4 slots, 100% GPU): score > 6.8M
-# Default 4 slots/GPU → caben 4 SMALL, ó 2 MEDIUM, ó 1 LARGE, ó 1 MEDIUM + 2 SMALL.
+# (ws · hd² · nl + ws² · hd · nl · 0.2, escalado por ph · ep):
+#   SMALL  (2 slots, ~50% GPU): score ≤ 1.5M
+#   MEDIUM (2 slots, ~50% GPU): 1.5M < score ≤ 30M
+#   LARGE  (4 slots, 100% GPU): score > 30M
+# Default 4 slots/GPU → caben 2 SMALL, ó 2 MEDIUM, ó 1 LARGE (1 SMALL + 1 MEDIUM también).
 max_slots_per_device: 4
 
 # Override opcional por device (útil si una GPU tiene menos VRAM):

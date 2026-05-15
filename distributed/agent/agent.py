@@ -113,24 +113,33 @@ def _order_candidates(candidates: list[dict], device: str,
     """
     Soft-preference ordering for what a worker on `device` should try first.
 
-    Priority:
+    Priority (bucket):
       1. exps in this agent's `owned` set whose registered config.device matches
       2. any exp whose registered config.device matches this worker's device
       3. exps in this agent's `owned` set
       4. anything else (so empty agents still consume foreign work)
+
+    Dentro de cada bucket: ordena por `slots_needed` ascendente (SMALL → MEDIUM
+    → LARGE) para maximizar paralelismo. P.ej. en cuda:0 (4 slots) prefiere 2
+    MEDIUM (4 slots, 2 tareas) antes que 1 LARGE (4 slots, 1 tarea); los LARGE
+    se coge cuando ya no quedan candidatos más pequeños o no caben más.
     """
-    def bucket(exp: dict) -> int:
+    from slots import get_slots_needed
+
+    def key(exp: dict) -> tuple[int, int]:
         cfg = exp.get("config") or {}
         cfg_dev = cfg.get("device")
         is_owned = owned is not None and exp["exp_name"] in owned
         if is_owned and cfg_dev == device:
-            return 0
-        if cfg_dev == device:
-            return 1
-        if is_owned:
-            return 2
-        return 3
-    return sorted(candidates, key=bucket)
+            b = 0
+        elif cfg_dev == device:
+            b = 1
+        elif is_owned:
+            b = 2
+        else:
+            b = 3
+        return (b, get_slots_needed(cfg))
+    return sorted(candidates, key=key)
 
 
 def _run_one_task(name: str, cfg: dict, device: str, dataset: str,

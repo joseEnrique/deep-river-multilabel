@@ -20,20 +20,48 @@ MEDIUM_SLOTS = 2
 LARGE_SLOTS = 4
 
 
+def _int(v, default: int = 1) -> int:
+    """Coerciona v a int; si falla devuelve default."""
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return default
+
+
+def _flatten_to_ints(x):
+    """Aplana listas/strings/escalares a una lista de ints (descarta lo no parseable)."""
+    if isinstance(x, (list, tuple)):
+        for y in x:
+            yield from _flatten_to_ints(y)
+    elif isinstance(x, str):
+        for tok in x.replace(",", " ").split():
+            try:
+                yield int(tok)
+            except ValueError:
+                pass
+    elif x is not None:
+        try:
+            yield int(x)
+        except (TypeError, ValueError):
+            pass
+
+
+def _max_hidden(cfg: dict, default: int = 32) -> int:
+    """Extrae max hidden dim, robusto a strings y listas anidadas (MLP hidden_dims)."""
+    raw = cfg.get("hidden_dim")
+    if raw is None:
+        raw = cfg.get("hidden_dims", default)
+    values = list(_flatten_to_ints(raw))
+    return max(values) if values else default
+
+
 def get_slots_needed(cfg: dict) -> int:
-    """Retorna 1 (SMALL), 2 (MEDIUM) o 4 (LARGE) según compute_score."""
-    arch = cfg.get("arch", cfg.get("architecture", ""))
-    ws = cfg.get("window_size", 1)
-
-    hd = cfg.get("hidden_dim", 32)
-    if isinstance(hd, list):
-        hd = max(hd)
-    elif "hidden_dims" in cfg:
-        hd = max(cfg["hidden_dims"])
-
-    nl = cfg.get("num_layers", 1)
-    ph = max(1, int(cfg.get("past_history", 1) or 1))
-    ep = max(1, int(cfg.get("epochs", 1) or 1))
+    """Retorna 2 (SMALL), 2 (MEDIUM) o 4 (LARGE) según compute_score."""
+    ws = _int(cfg.get("window_size", 1), 1)
+    hd = _max_hidden(cfg, 32)
+    nl = _int(cfg.get("num_layers", 1), 1)
+    ph = max(1, _int(cfg.get("past_history", 1), 1))
+    ep = max(1, _int(cfg.get("epochs", 1), 1))
 
     score = ws * (hd ** 2) * nl
     # Mismo perfil de coste para todas las arquitecturas: término cuadrático
