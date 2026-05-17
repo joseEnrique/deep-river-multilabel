@@ -7,10 +7,19 @@ en una GPU de 4 slots, hasta 2 SMALL, 2 MEDIUM o 1 LARGE en paralelo
 (válido para MLP, LSTM y CNN — misma fórmula de coste).
 """
 
-# Boundary scores. Misma fórmula para todas las arquitecturas (MLP/LSTM/CNN):
+# Boundary scores. Fórmula común:
 #   compute_score = (ws · hd² · nl + ws² · hd · nl · 0.2) · ph · ep
-SMALL_CEILING = 1_500_000    # ≤ → SMALL (2 slots)
-MEDIUM_CEILING = 30_000_000  # ≤ → MEDIUM (2 slots), > → LARGE (4 slots)
+SMALL_CEILING = 1_500_000  # ≤ → SMALL (2 slots) para cualquier arch.
+
+# MEDIUM_CEILING depende del arch — los matmuls densos (CNN/MLP/LSTM) caben
+# bien en VRAM compartida; Transformer tiene attention O(seq²·heads) que
+# satura antes.
+MEDIUM_CEILING_DEFAULT = 2_000_000_000   # CNN/MLP/LSTM/otros: 2B → casi todo MEDIUM
+MEDIUM_CEILING_TRANSFORMER = 30_000_000  # Transformer: 30M → grandes siguen LARGE
+
+
+def _medium_ceiling(arch: str) -> int:
+    return MEDIUM_CEILING_TRANSFORMER if arch == "Transformer" else MEDIUM_CEILING_DEFAULT
 
 # Default si el config del agent no define `max_slots_per_device`.
 DEFAULT_MAX_SLOTS_PER_GPU = 4
@@ -56,7 +65,8 @@ def _max_hidden(cfg: dict, default: int = 32) -> int:
 
 
 def get_slots_needed(cfg: dict) -> int:
-    """Retorna 2 (SMALL), 2 (MEDIUM) o 4 (LARGE) según compute_score."""
+    """Retorna 2 (SMALL), 2 (MEDIUM) o 4 (LARGE) según compute_score y arch."""
+    arch = str(cfg.get("architecture") or cfg.get("arch") or "")
     ws = _int(cfg.get("window_size", 1), 1)
     hd = _max_hidden(cfg, 32)
     nl = _int(cfg.get("num_layers", 1), 1)
@@ -64,8 +74,8 @@ def get_slots_needed(cfg: dict) -> int:
     ep = max(1, _int(cfg.get("epochs", 1), 1))
 
     score = ws * (hd ** 2) * nl
-    # Mismo perfil de coste para todas las arquitecturas: término cuadrático
-    # en ws con factor 0.2 (las RTX 3090 paralelizan bien matmuls grandes).
+    # Término cuadrático en ws con factor 0.2 (las RTX 3090 paralelizan bien
+    # matmuls grandes; pero attention en Transformer escala peor).
     score += (ws ** 2) * hd * nl * 0.2
 
     # past_history y epochs aumentan el coste lineal con cada uno para todos
@@ -74,6 +84,6 @@ def get_slots_needed(cfg: dict) -> int:
 
     if score <= SMALL_CEILING:
         return SMALL_SLOTS
-    if score <= MEDIUM_CEILING:
+    if score <= _medium_ceiling(arch):
         return MEDIUM_SLOTS
     return LARGE_SLOTS

@@ -604,9 +604,9 @@ def main():
             return f"{h}h{m:02d}m{sec:02d}s"
 
         def parse_cfg_from_name(name: str) -> dict:
-            """Extrae arch, hidden_dim(s), num_layers y window_size desde el exp_name."""
+            """Extrae arch, hidden_dim(s), num_layers, window_size, past_history, epochs."""
             m = re.match(
-                r"^(?P<arch>[A-Za-z]+)_[^_]+_ph\d+_h(?P<hd>[\d\-]+)_nl(?P<nl>\d+)_w(?P<ws>\d+)_",
+                r"^(?P<arch>[A-Za-z]+)_[^_]+_ph(?P<ph>\d+)_h(?P<hd>[\d\-]+)_nl(?P<nl>\d+)_w(?P<ws>\d+)_",
                 name,
             )
             if not m:
@@ -616,15 +616,26 @@ def main():
                 "architecture": m.group("arch"),
                 "num_layers":   int(m.group("nl")),
                 "window_size":  int(m.group("ws")),
+                "past_history": int(m.group("ph")),
             }
             if "-" in hd_raw:
                 cfg["hidden_dims"] = [int(x) for x in hd_raw.split("-")]
             else:
                 cfg["hidden_dim"] = int(hd_raw)
+            m_ep = re.search(r"_ep(\d+)_", name)
+            if m_ep:
+                cfg["epochs"] = int(m_ep.group(1))
             return cfg
 
         def tier_label(slots: int) -> str:
-            return {1: "SMALL", 2: "MEDIUM", 4: "LARGE"}.get(slots, f"{slots}slots")
+            # SMALL y MEDIUM ambos = 2 slots; distinguir por score sería rehacer la
+            # cuenta. Etiquetamos por capacidad real: 2 slots → MEDIUM, 4 → LARGE.
+            from slots import SMALL_SLOTS, MEDIUM_SLOTS, LARGE_SLOTS
+            if slots == LARGE_SLOTS:
+                return "LARGE"
+            if slots == MEDIUM_SLOTS or slots == SMALL_SLOTS:
+                return "MEDIUM"
+            return f"{slots}slots"
 
         counts = s.get("counts", {})
         print(f"[summary] dataset={s.get('dataset')} total={s.get('total')}")
