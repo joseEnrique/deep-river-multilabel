@@ -80,7 +80,7 @@ model:
   optimizer: [adam]
   window_size: [50]
   hidden_dims:
-  - [128 64]
+  - [128, 64]
   lr: [0.001]
   dropout: [0]
   normalization: [none]
@@ -92,7 +92,7 @@ model:
   optimizer: [adam]
   window_size: [50]
   hidden_dims:
-  - [64 32]
+  - [64, 32]
   lr: [0.001]
   dropout: [0]
   normalization: [none]
@@ -104,7 +104,7 @@ model:
   optimizer: [adam]
   window_size: [50]
   hidden_dims:
-  - [128 64]
+  - [128, 64]
   lr: [0.0001]
   dropout: [0]
   normalization: [layernorm]
@@ -116,7 +116,7 @@ model:
   optimizer: [adam]
   window_size: [200]
   hidden_dims:
-  - [128 64]
+  - [128, 64]
   lr: [0.001]
   dropout: [0]
   normalization: [none]
@@ -441,7 +441,7 @@ model:
   optimizer: [adam]
   window_size: [50]
   hidden_dims:
-  - [128 64 32]
+  - [128, 64, 32]
   lr: [0.0001]
   dropout: [0]
   normalization: [layernorm]
@@ -453,7 +453,7 @@ model:
   optimizer: [adam]
   window_size: [200]
   hidden_dims:
-  - [128 64]
+  - [128, 64]
   lr: [0.001]
   dropout: [0]
   normalization: [layernorm]
@@ -465,7 +465,7 @@ model:
   optimizer: [adam]
   window_size: [200]
   hidden_dims:
-  - [64 32]
+  - [64, 32]
   lr: [0.001]
   dropout: [0]
   normalization: [none]
@@ -477,7 +477,7 @@ model:
   optimizer: [adam]
   window_size: [200]
   hidden_dims:
-  - [64 32]
+  - [64, 32]
   lr: [0.001]
   dropout: [0]
   normalization: [layernorm]
@@ -489,7 +489,7 @@ model:
   optimizer: [adam]
   window_size: [50]
   hidden_dims:
-  - [128 64]
+  - [128, 64]
   lr: [0.001]
   dropout: [0]
   normalization: [layernorm]
@@ -501,7 +501,7 @@ model:
   optimizer: [adam]
   window_size: [200]
   hidden_dims:
-  - [128 64]
+  - [128, 64]
   lr: [0.0001]
   dropout: [0]
   normalization: [layernorm]
@@ -513,7 +513,7 @@ model:
   optimizer: [adam]
   window_size: [200]
   hidden_dims:
-  - [128 64 32]
+  - [128, 64, 32]
   lr: [0.0001]
   dropout: [0]
   normalization: [layernorm]
@@ -525,7 +525,7 @@ model:
   optimizer: [adam]
   window_size: [50]
   hidden_dims:
-  - [128 64 32]
+  - [128, 64, 32]
   lr: [0.001]
   dropout: [0]
   normalization: [none]
@@ -537,7 +537,7 @@ model:
   optimizer: [adam]
   window_size: [200]
   hidden_dims:
-  - [128 64]
+  - [128, 64]
   lr: [0.001]
   dropout: [0.2]
   normalization: [none]
@@ -549,7 +549,7 @@ model:
   optimizer: [adam]
   window_size: [200]
   hidden_dims:
-  - [128 64 32]
+  - [128, 64, 32]
   lr: [0.0001]
   dropout: [0]
   normalization: [none]
@@ -561,7 +561,7 @@ model:
   optimizer: [adam]
   window_size: [50]
   hidden_dims:
-  - [128 64]
+  - [128, 64]
   lr: [0.001]
   dropout: [0.2]
   normalization: [none]
@@ -573,7 +573,7 @@ model:
   optimizer: [adam]
   window_size: [200]
   hidden_dims:
-  - [128 64 32]
+  - [128, 64, 32]
   lr: [0.001]
   dropout: [0]
   normalization: [none]
@@ -585,19 +585,7 @@ model:
   optimizer: [adam]
   window_size: [50]
   hidden_dims:
-  - [64 32]
-  lr: [0.001]
-  dropout: [0]
-  normalization: [layernorm]
-  seed: [42]
-  past_history: [10, 20]
-  epochs: [10, 20]
-- architecture: [MLP]
-  device: ['cuda:0']
-  optimizer: [adam]
-  window_size: [200]
-  hidden_dims:
-  - [128 64 32]
+  - [64, 32]
   lr: [0.001]
   dropout: [0]
   normalization: [layernorm]
@@ -609,7 +597,19 @@ model:
   optimizer: [adam]
   window_size: [200]
   hidden_dims:
-  - [128 64]
+  - [128, 64, 32]
+  lr: [0.001]
+  dropout: [0]
+  normalization: [layernorm]
+  seed: [42]
+  past_history: [10, 20]
+  epochs: [10, 20]
+- architecture: [MLP]
+  device: ['cuda:0']
+  optimizer: [adam]
+  window_size: [200]
+  hidden_dims:
+  - [128, 64]
   lr: [0.0001]
   dropout: [0]
   normalization: [none]
@@ -621,7 +621,7 @@ model:
   optimizer: [adam]
   window_size: [50]
   hidden_dims:
-  - [128 64 32]
+  - [128, 64, 32]
   lr: [0.0001]
   dropout: [0]
   normalization: [none]
@@ -633,7 +633,7 @@ model:
   optimizer: [adam]
   window_size: [50]
   hidden_dims:
-  - [128 64]
+  - [128, 64]
   lr: [0.0001]
   dropout: [0]
   normalization: [none]
@@ -645,7 +645,7 @@ model:
   optimizer: [adam]
   window_size: [200]
   hidden_dims:
-  - [128 64]
+  - [128, 64]
   lr: [0.01]
   dropout: [0]
   normalization: [layernorm]
