@@ -594,7 +594,7 @@ def main():
 
     if args.summary:
         import re
-        from slots import get_slots_needed
+        from slots import get_tier
         s = client.summary()
 
         def fmt_eta(secs: float) -> str:
@@ -627,16 +627,6 @@ def main():
                 cfg["epochs"] = int(m_ep.group(1))
             return cfg
 
-        def tier_label(slots: int) -> str:
-            # SMALL y MEDIUM ambos = 2 slots; distinguir por score sería rehacer la
-            # cuenta. Etiquetamos por capacidad real: 2 slots → MEDIUM, 4 → LARGE.
-            from slots import SMALL_SLOTS, MEDIUM_SLOTS, LARGE_SLOTS
-            if slots == LARGE_SLOTS:
-                return "LARGE"
-            if slots == MEDIUM_SLOTS or slots == SMALL_SLOTS:
-                return "MEDIUM"
-            return f"{slots}slots"
-
         counts = s.get("counts", {})
         print(f"[summary] dataset={s.get('dataset')} total={s.get('total')}")
         for k in ("pending", "running", "done", "failed"):
@@ -658,16 +648,11 @@ def main():
             running_with_tier = []
             for r in running:
                 cfg_inferred = parse_cfg_from_name(r.get("exp_name", ""))
-                if cfg_inferred:
-                    slots = get_slots_needed(cfg_inferred)
-                    label = tier_label(slots)
-                else:
-                    slots = 0
-                    label = "?"
+                label = get_tier(cfg_inferred) if cfg_inferred else "?"
                 tiers[label] += 1
                 key = (r.get("agent_id") or "-", r.get("device") or "-")
                 by_node[key][label] += 1
-                running_with_tier.append((r, label, slots))
+                running_with_tier.append((r, label))
 
             print(f"\n[running] {len(running)} experimento(s) en curso:")
             print(f"  tiers: SMALL={tiers['SMALL']}  MEDIUM={tiers['MEDIUM']}  "
@@ -680,7 +665,7 @@ def main():
                 print(f"  {ag:<24} {dev:<10} {c['SMALL']:>6} {c['MEDIUM']:>7} {c['LARGE']:>6}  {total:>5}")
 
             print(f"\n  {'TIER':<7} {'ARCH':<12} {'AGENT':<24} {'DEVICE':<10} {'ELAPSED':>10}  EXP_NAME")
-            for r, label, _ in running_with_tier:
+            for r, label in running_with_tier:
                 arch = r.get("architecture") or "-"
                 ag = r.get("agent_id") or "-"
                 dev = r.get("device") or "-"

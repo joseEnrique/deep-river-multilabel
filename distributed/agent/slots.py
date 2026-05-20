@@ -7,15 +7,16 @@ en una GPU de 4 slots, hasta 2 SMALL, 2 MEDIUM o 1 LARGE en paralelo
 (válido para MLP, LSTM y CNN — misma fórmula de coste).
 """
 
-# Boundary scores. Fórmula común:
-#   compute_score = (ws · hd² · nl + ws² · hd · nl · 0.2) · ph · ep
-SMALL_CEILING = 1_500_000  # ≤ → SMALL (2 slots) para cualquier arch.
+# Boundary scores. Mide SM utilization concurrente (no tiempo total), por eso
+# `epochs` y `past_history` no entran: afectan duración, no compute simultáneo.
+#   compute_score = hd² · nl                       (matmuls densos: MLP/CNN/LSTM)
+#                 + ws² · 0.5      (solo Transformer, captura attention O(L²))
+# Modelos con hd<=32 son launch-bound (kernels CUDA pequeños), la GPU pasa la
+# mitad esperando → tier SMALL/MEDIUM aunque haya muchas epochs.
+SMALL_CEILING = 5_000   # hd≤64 nl=1 sin attention → kernels triviales.
 
-# MEDIUM_CEILING depende del arch — los matmuls densos (CNN/MLP/LSTM) caben
-# bien en VRAM compartida; Transformer tiene attention O(seq²·heads) que
-# satura antes.
-MEDIUM_CEILING_DEFAULT = 2_000_000_000   # CNN/MLP/LSTM/otros: 2B → casi todo MEDIUM
-MEDIUM_CEILING_TRANSFORMER = 30_000_000  # Transformer: 30M → grandes siguen LARGE
+MEDIUM_CEILING_DEFAULT = 50_000      # hd=128 nl≤2 cabe como MEDIUM.
+MEDIUM_CEILING_TRANSFORMER = 50_000  # Transformer hd≤64 con ws=200 → MEDIUM.
 
 
 def _medium_ceiling(arch: str) -> int:
@@ -64,26 +65,29 @@ def _max_hidden(cfg: dict, default: int = 32) -> int:
     return max(values) if values else default
 
 
-def get_slots_needed(cfg: dict) -> int:
-    """Retorna 2 (SMALL), 2 (MEDIUM) o 4 (LARGE) según compute_score y arch."""
+def get_tier(cfg: dict) -> str:
+    """Retorna 'SMALL', 'MEDIUM' o 'LARGE' según compute_score y arch."""
     arch = str(cfg.get("architecture") or cfg.get("arch") or "")
     ws = _int(cfg.get("window_size", 1), 1)
     hd = _max_hidden(cfg, 32)
     nl = _int(cfg.get("num_layers", 1), 1)
-    ph = max(1, _int(cfg.get("past_history", 1), 1))
-    ep = max(1, _int(cfg.get("epochs", 1), 1))
 
-    score = ws * (hd ** 2) * nl
-    # Término cuadrático en ws con factor 0.2 (las RTX 3090 paralelizan bien
-    # matmuls grandes; pero attention en Transformer escala peor).
-    score += (ws ** 2) * hd * nl * 0.2
-
-    # past_history y epochs aumentan el coste lineal con cada uno para todos
-    # los modelos (más timesteps por forward · más pasadas del optimizador).
-    score *= ph * ep
+    # Matmuls densos (FFN, conv, gates LSTM): coste cuadrático en hidden_dim.
+    score = (hd ** 2) * nl
+    # Attention solo en Transformer: matriz L×L domina con ws grande.
+    if arch == "Transformer":
+        score += (ws ** 2) * 0.5
 
     if score <= SMALL_CEILING:
-        return SMALL_SLOTS
+        return "SMALL"
     if score <= _medium_ceiling(arch):
-        return MEDIUM_SLOTS
-    return LARGE_SLOTS
+        return "MEDIUM"
+    return "LARGE"
+
+
+_TIER_TO_SLOTS = {"SMALL": SMALL_SLOTS, "MEDIUM": MEDIUM_SLOTS, "LARGE": LARGE_SLOTS}
+
+
+def get_slots_needed(cfg: dict) -> int:
+    """Retorna 2 (SMALL), 2 (MEDIUM) o 4 (LARGE) según compute_score y arch."""
+    return _TIER_TO_SLOTS[get_tier(cfg)]
