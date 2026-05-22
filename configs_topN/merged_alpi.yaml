@@ -1,5 +1,5 @@
 backend_url: http://13.37.80.70:8080
-api_key: Golaso1992?
+api_key: chinga
 agent_id: null
 devices: ['cuda:0', 'cuda:1']
 max_slots_per_device: 4
