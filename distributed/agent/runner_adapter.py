@@ -106,6 +106,16 @@ def _extract(m: Metrics) -> dict[str, float]:
     }
 
 
+def _loss_logs(loss_fn) -> dict[str, float]:
+    """Estado interno de las losses adaptativas (alpha/gamma por clase, F1 EMA).
+
+    Devuelve {} para losses sin get_logs (BCE, StaticFocal) o si la loss aún no
+    se ha inicializado (num_classes se fija en el primer forward)."""
+    if hasattr(loss_fn, "get_logs") and getattr(loss_fn, "num_classes", None):
+        return loss_fn.get_logs()
+    return {}
+
+
 def _coerce_types(cfg: dict) -> dict:
     float_keys = {"lr", "dropout"}
     int_keys   = {"past_history", "window_size", "hidden_dim", "num_layers",
@@ -200,7 +210,10 @@ def run_with_backend(exp_name: str, config: dict, device_str: str,
         step_n  = cp["Step"]
         elapsed = cp["Time"].total_seconds()
         mv = _extract(metrics)
+        mv.update(_loss_logs(loss_fn))
         on_checkpoint(step_n, elapsed, mv)
 
     duration = time.time() - start
-    on_finish(_extract(metrics), duration)
+    final = _extract(metrics)
+    final.update(_loss_logs(loss_fn))
+    on_finish(final, duration)
