@@ -130,15 +130,21 @@ def _order_candidates(candidates: list[dict], device: str,
     """
     Soft-preference ordering for what a worker on `device` should try first.
 
-    Priority (bucket):
+    Bucket de afinidad (device/owned):
       1. exps in this agent's `owned` set whose registered config.device matches
       2. any exp whose registered config.device matches this worker's device
       3. exps in this agent's `owned` set
       4. anything else (so empty agents still consume foreign work)
 
-    Dentro de cada bucket, según `pick_order`:
+    IMPORTANTE: con "speed_asc"/"speed_desc" el tier de velocidad va DELANTE del
+    bucket, no dentro. Si no, el bucket manda y un CNN ep=20 asignado a esta GPU
+    adelanta a un LSTM ep=1 asignado a otra — justo lo contrario de "primero lo
+    rápido". Con "size_*"/"slots" el bucket sigue mandando (comportamiento
+    histórico).
+
+    Criterio dentro del bucket (o dentro del tier), según `pick_order`:
       • "speed_asc"  (DEFAULT): tier de duración por `epochs` ascendente —
-        FAST (ep<3) → MEDIUM (3≤ep≤10) → SLOW (ep>10); a igualdad de tier,
+        FAST (ep≤3) → MEDIUM (3<ep<10) → SLOW (ep≥10); a igualdad de tier,
         modelo más pequeño primero (`compute_score`). Vacía primero lo barato,
         así los resultados llegan pronto y los runs largos quedan al final.
       • "speed_desc" : tier de duración descendente — SLOW primero (útil para
@@ -171,15 +177,42 @@ def _order_candidates(candidates: list[dict], device: str,
             b = 3
         slots = float(get_slots_needed(cfg))
         if pick_order == "speed_asc":
-            return (b, float(get_speed_rank(cfg)), get_compute_score(cfg), slots)
+            return (float(get_speed_rank(cfg)), b, get_compute_score(cfg), slots)
         if pick_order == "speed_desc":
-            return (b, -float(get_speed_rank(cfg)), get_compute_score(cfg), slots)
+            return (-float(get_speed_rank(cfg)), b, get_compute_score(cfg), slots)
         if pick_order == "size_asc":
             return (b, 0.0, get_compute_score(cfg), slots)
         if pick_order == "size_desc":
             return (b, 0.0, -get_compute_score(cfg), slots)
         return (b, 0.0, slots, 0.0)
     return sorted(candidates, key=key)
+
+
+# El backend sirve `GET /experiments` ordenado por `created_at` asc y paginado.
+# Si solo pedimos la primera página, `pick_order` ordena una ventana arbitraria
+# (la parte más vieja del grid), no la cola entera: los ep=1 registrados después
+# nunca se ven y el agente parece "terminar una arquitectura antes de saltar a
+# la siguiente". Paginamos hasta agotar y cacheamos el resultado, porque la cola
+# completa son ~10 MB y no se puede refetchear en cada vuelta del bucle.
+CANDIDATE_PAGE = 2000
+CANDIDATE_MAX = 200_000
+DEFAULT_CANDIDATE_CACHE_S = 60.0
+
+
+def _fetch_all(client: BackendClient, status: str,
+               page: int = CANDIDATE_PAGE, cap: int = CANDIDATE_MAX) -> list[dict]:
+    """Pagina `client.list(status=...)` hasta agotar la cola (o llegar a `cap`)."""
+    out: list[dict] = []
+    offset = 0
+    while len(out) < cap:
+        batch = client.list(status=status, limit=page, offset=offset)
+        out.extend(batch)
+        if len(batch) < page:
+            break
+        offset += page
+    if len(out) >= cap:
+        print(f"[agent] aviso: cola '{status}' truncada a {cap} candidatos", flush=True)
+    return out
 
 
 def _run_one_task(name: str, cfg: dict, device: str, dataset: str,
@@ -246,7 +279,8 @@ def worker_main(device: str, agent_id: str, dataset: str, base_url: str,
                 consume_any: bool,
                 api_key: str | None,
                 max_slots: int,
-                pick_order: str = DEFAULT_PICK_ORDER) -> None:
+                pick_order: str = DEFAULT_PICK_ORDER,
+                candidate_cache_s: float = DEFAULT_CANDIDATE_CACHE_S) -> None:
     """Despachador con slots: hasta `max_slots` experimentos concurrentes en `device`.
     SMALL/MEDIUM=2 slots, LARGE=4 slots (slots.get_slots_needed). Calcado del scheduler local."""
     import threading
@@ -299,20 +333,42 @@ def worker_main(device: str, agent_id: str, dataset: str, base_url: str,
                 cond.notify_all()
         return _cb
 
+    # Cola de candidatos cacheada: la cola completa son ~10 MB, así que se
+    # refresca cada `candidate_cache_s` en vez de en cada vuelta. `taken` son
+    # los nombres ya reclamados (por nosotros o por otro agente) que no hay que
+    # reintentar hasta el siguiente refresco.
+    cache: list[dict] = []
+    cache_ts = 0.0
+    taken: set[str] = set()
+
     with concurrent.futures.ProcessPoolExecutor(max_workers=max_slots) as executor:
         while True:
             with cond:
                 while available_slots == 0:
                     cond.wait()
 
-            pending = client.list(status="pending", limit=2000)
-            failed = client.list(status="failed", limit=500)
-            candidates = pending + failed
+            now = time.monotonic()
+            refreshed = False
+            if not cache or (now - cache_ts) >= candidate_cache_s:
+                items = _fetch_all(client, "pending") + _fetch_all(client, "failed")
+                if not consume_any and owned_set is not None:
+                    items = [c for c in items if c["exp_name"] in owned_set]
+                cache = _order_candidates(items, device, owned_set, pick_order)
+                cache_ts = now
+                taken.clear()
+                refreshed = True
+                head = cache[0]["exp_name"] if cache else "-"
+                print(f"[{device}] queue refreshed: {len(cache)} candidates, "
+                      f"next={head}", flush=True)
 
-            if not consume_any and owned_set is not None:
-                candidates = [c for c in candidates if c["exp_name"] in owned_set]
+            candidates = [c for c in cache if c["exp_name"] not in taken]
 
             if not candidates:
+                if not refreshed:
+                    # La caché está agotada pero puede estar rancia: fuerza
+                    # refetch en la siguiente vuelta antes de decidir salir.
+                    cache_ts = 0.0
+                    continue
                 # Nada pendiente. Si todos los slots están libres, salimos;
                 # si hay tareas en vuelo, esperamos a que se vacíen.
                 with cond:
@@ -321,8 +377,6 @@ def worker_main(device: str, agent_id: str, dataset: str, base_url: str,
                         return
                 time.sleep(poll_interval)
                 continue
-
-            candidates = _order_candidates(candidates, device, owned_set, pick_order)
 
             launched_any = False
             for exp in candidates:
@@ -369,6 +423,7 @@ def worker_main(device: str, agent_id: str, dataset: str, base_url: str,
 
                 name = exp["exp_name"]
                 claimed = client.claim(name, device=device)
+                taken.add(name)  # nuestro o de otro: no reintentar en esta caché
                 if claimed is None:
                     continue  # otro agent se lo llevó
 
@@ -608,6 +663,7 @@ def main():
     poll_interval = float(cfg.get("poll_interval", 5.0))
     consume_any = bool(cfg.get("consume_any", True))
     pick_order = _resolve_pick_order(cfg.get("pick_order"))
+    candidate_cache_s = float(cfg.get("candidate_cache_s", DEFAULT_CANDIDATE_CACHE_S))
     local_db_path = str(cfg.get("local_db_path") or (HERE / f"local_{dataset}.db"))
     api_key = cfg.get("api_key") or os.environ.get("BACKEND_API_KEY") or None
 
@@ -625,7 +681,7 @@ def main():
     print(f"[agent] id={agent_id} backend={backend_url} dataset={dataset} "
           f"devices={devices} consume_any={consume_any}", flush=True)
     print(f"[agent] slots/device: {slots_for}", flush=True)
-    print(f"[agent] pick_order: {pick_order}", flush=True)
+    print(f"[agent] pick_order: {pick_order} (candidate_cache_s={candidate_cache_s})", flush=True)
     print(f"[agent] local mirror: {local_db_path}", flush=True)
 
     if args.status:
@@ -754,7 +810,7 @@ def main():
                              checkpoint_every, poll_interval,
                              list(owned) if owned else None,
                              local_db_path, consume_any, api_key,
-                             slots_for[d], pick_order),
+                             slots_for[d], pick_order, candidate_cache_s),
                        name=f"worker-{d}")
         p.start()
         procs.append(p)

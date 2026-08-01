@@ -103,11 +103,11 @@ _TIER_TO_SLOTS = {"SMALL": SMALL_SLOTS, "MEDIUM": MEDIUM_SLOTS, "LARGE": LARGE_S
 # Ortogonales al tier de compute: `epochs` no afecta a la utilización simultánea
 # de la GPU (y por eso no entra en compute_score), pero sí al tiempo de pared.
 # Solo se usan para decidir QUÉ experimento coger antes, nunca cuántos slots.
-#   FAST   : ep < 3          (en los grids típicos: ep=1)
-#   MEDIUM : 3 <= ep <= 10   (ep=3, ep=10)
-#   SLOW   : ep > 10         (ep=20)
-FAST_EPOCHS_BELOW = 3
-MEDIUM_EPOCHS_MAX = 10
+#   FAST   : ep <= 3         (en los grids típicos: ep=1, ep=3)
+#   MEDIUM : 3 < ep < 10     (vacío en los grids actuales)
+#   SLOW   : ep >= 10        (ep=10, ep=20)
+FAST_EPOCHS_MAX = 3
+SLOW_EPOCHS_FROM = 10
 
 _SPEED_RANK = {"FAST": 0, "MEDIUM": 1, "SLOW": 2}
 
@@ -115,9 +115,9 @@ _SPEED_RANK = {"FAST": 0, "MEDIUM": 1, "SLOW": 2}
 def get_speed_tier(cfg: dict) -> str:
     """Retorna 'FAST', 'MEDIUM' o 'SLOW' según `epochs`."""
     ep = _int(cfg.get("epochs", 1), 1)
-    if ep < FAST_EPOCHS_BELOW:
+    if ep <= FAST_EPOCHS_MAX:
         return "FAST"
-    if ep <= MEDIUM_EPOCHS_MAX:
+    if ep < SLOW_EPOCHS_FROM:
         return "MEDIUM"
     return "SLOW"
 
