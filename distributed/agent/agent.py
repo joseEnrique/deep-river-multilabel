@@ -108,8 +108,25 @@ def register_grid(client: BackendClient, local: LocalDB, dataset: str,
 
 # ── Worker (one process per GPU) ──────────────────────────────────────────────
 
+PICK_ORDERS = ("speed_asc", "speed_desc", "size_asc", "size_desc", "slots")
+DEFAULT_PICK_ORDER = "speed_asc"
+
+
+def _resolve_pick_order(value) -> str:
+    """Normaliza `pick_order` del YAML; valor desconocido → default con aviso."""
+    if value is None:
+        return DEFAULT_PICK_ORDER
+    v = str(value).strip().lower()
+    if v in PICK_ORDERS:
+        return v
+    print(f"[agent] pick_order='{value}' desconocido; usando "
+          f"'{DEFAULT_PICK_ORDER}' (válidos: {', '.join(PICK_ORDERS)})", flush=True)
+    return DEFAULT_PICK_ORDER
+
+
 def _order_candidates(candidates: list[dict], device: str,
-                      owned: set[str] | None) -> list[dict]:
+                      owned: set[str] | None,
+                      pick_order: str = DEFAULT_PICK_ORDER) -> list[dict]:
     """
     Soft-preference ordering for what a worker on `device` should try first.
 
@@ -119,14 +136,28 @@ def _order_candidates(candidates: list[dict], device: str,
       3. exps in this agent's `owned` set
       4. anything else (so empty agents still consume foreign work)
 
-    Dentro de cada bucket: ordena por `slots_needed` ascendente (SMALL → MEDIUM
-    → LARGE) para maximizar paralelismo. P.ej. en cuda:0 (4 slots) prefiere 2
-    MEDIUM (4 slots, 2 tareas) antes que 1 LARGE (4 slots, 1 tarea); los LARGE
-    se coge cuando ya no quedan candidatos más pequeños o no caben más.
-    """
-    from slots import get_slots_needed
+    Dentro de cada bucket, según `pick_order`:
+      • "speed_asc"  (DEFAULT): tier de duración por `epochs` ascendente —
+        FAST (ep<3) → MEDIUM (3≤ep≤10) → SLOW (ep>10); a igualdad de tier,
+        modelo más pequeño primero (`compute_score`). Vacía primero lo barato,
+        así los resultados llegan pronto y los runs largos quedan al final.
+      • "speed_desc" : tier de duración descendente — SLOW primero (útil para
+        arrancar los runs largos cuanto antes si el grid se va a dejar toda la
+        noche); dentro del tier, sigue prefiriendo el modelo más pequeño.
+      • "size_asc"   : solo `compute_score` ascendente, ignorando epochs.
+      • "size_desc"  : solo `compute_score` descendente.
+      • "slots"      : comportamiento histórico, `slots_needed` ascendente
+        (SMALL/MEDIUM → LARGE) sin desempate. P.ej. en cuda:0 (4 slots)
+        prefiere 2 MEDIUM (4 slots, 2 tareas) antes que 1 LARGE (4 slots,
+        1 tarea); los LARGE se cogen cuando ya no quedan candidatos más
+        pequeños o no caben más.
 
-    def key(exp: dict) -> tuple[int, int]:
+    Ninguna opción cambia cuántos slots consume un experimento ni las reglas de
+    admisión: solo el orden en que se intentan.
+    """
+    from slots import get_slots_needed, get_compute_score, get_speed_rank
+
+    def key(exp: dict):
         cfg = exp.get("config") or {}
         cfg_dev = cfg.get("device")
         is_owned = owned is not None and exp["exp_name"] in owned
@@ -138,7 +169,16 @@ def _order_candidates(candidates: list[dict], device: str,
             b = 2
         else:
             b = 3
-        return (b, get_slots_needed(cfg))
+        slots = float(get_slots_needed(cfg))
+        if pick_order == "speed_asc":
+            return (b, float(get_speed_rank(cfg)), get_compute_score(cfg), slots)
+        if pick_order == "speed_desc":
+            return (b, -float(get_speed_rank(cfg)), get_compute_score(cfg), slots)
+        if pick_order == "size_asc":
+            return (b, 0.0, get_compute_score(cfg), slots)
+        if pick_order == "size_desc":
+            return (b, 0.0, -get_compute_score(cfg), slots)
+        return (b, 0.0, slots, 0.0)
     return sorted(candidates, key=key)
 
 
@@ -205,7 +245,8 @@ def worker_main(device: str, agent_id: str, dataset: str, base_url: str,
                 local_db_path: str,
                 consume_any: bool,
                 api_key: str | None,
-                max_slots: int) -> None:
+                max_slots: int,
+                pick_order: str = DEFAULT_PICK_ORDER) -> None:
     """Despachador con slots: hasta `max_slots` experimentos concurrentes en `device`.
     SMALL/MEDIUM=2 slots, LARGE=4 slots (slots.get_slots_needed). Calcado del scheduler local."""
     import threading
@@ -219,7 +260,7 @@ def worker_main(device: str, agent_id: str, dataset: str, base_url: str,
     owned_set = set(owned_filter) if owned_filter is not None else None
     mode = "consume-any" if consume_any else "owned-only"
     print(f"[{device}] worker started (pid={pid}, agent={agent_id}, mode={mode}, "
-          f"max_slots={max_slots})", flush=True)
+          f"max_slots={max_slots}, pick_order={pick_order})", flush=True)
 
     available_slots = max_slots
     # Contadores:
@@ -281,7 +322,7 @@ def worker_main(device: str, agent_id: str, dataset: str, base_url: str,
                 time.sleep(poll_interval)
                 continue
 
-            candidates = _order_candidates(candidates, device, owned_set)
+            candidates = _order_candidates(candidates, device, owned_set, pick_order)
 
             launched_any = False
             for exp in candidates:
@@ -566,6 +607,7 @@ def main():
     checkpoint_every = int(cfg.get("checkpoint_every", 1000))
     poll_interval = float(cfg.get("poll_interval", 5.0))
     consume_any = bool(cfg.get("consume_any", True))
+    pick_order = _resolve_pick_order(cfg.get("pick_order"))
     local_db_path = str(cfg.get("local_db_path") or (HERE / f"local_{dataset}.db"))
     api_key = cfg.get("api_key") or os.environ.get("BACKEND_API_KEY") or None
 
@@ -583,6 +625,7 @@ def main():
     print(f"[agent] id={agent_id} backend={backend_url} dataset={dataset} "
           f"devices={devices} consume_any={consume_any}", flush=True)
     print(f"[agent] slots/device: {slots_for}", flush=True)
+    print(f"[agent] pick_order: {pick_order}", flush=True)
     print(f"[agent] local mirror: {local_db_path}", flush=True)
 
     if args.status:
@@ -711,7 +754,7 @@ def main():
                              checkpoint_every, poll_interval,
                              list(owned) if owned else None,
                              local_db_path, consume_any, api_key,
-                             slots_for[d]),
+                             slots_for[d], pick_order),
                        name=f"worker-{d}")
         p.start()
         procs.append(p)

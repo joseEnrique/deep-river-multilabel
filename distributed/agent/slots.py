@@ -65,18 +65,29 @@ def _max_hidden(cfg: dict, default: int = 32) -> int:
     return max(values) if values else default
 
 
-def get_tier(cfg: dict) -> str:
-    """Retorna 'SMALL', 'MEDIUM' o 'LARGE' según compute_score y arch."""
+def get_compute_score(cfg: dict) -> float:
+    """compute_score continuo del modelo (mismo que decide el tier).
+
+    Útil para ordenar candidatos de menor a mayor modelo con granularidad
+    más fina que el tier (p.ej. hd=32 antes que hd=64, ambos SMALL).
+    """
     arch = str(cfg.get("architecture") or cfg.get("arch") or "")
     ws = _int(cfg.get("window_size", 1), 1)
     hd = _max_hidden(cfg, 32)
     nl = _int(cfg.get("num_layers", 1), 1)
 
     # Matmuls densos (FFN, conv, gates LSTM): coste cuadrático en hidden_dim.
-    score = (hd ** 2) * nl
+    score = float((hd ** 2) * nl)
     # Attention solo en Transformer: matriz L×L domina con ws grande.
     if arch == "Transformer":
         score += (ws ** 2) * 0.5
+    return score
+
+
+def get_tier(cfg: dict) -> str:
+    """Retorna 'SMALL', 'MEDIUM' o 'LARGE' según compute_score y arch."""
+    arch = str(cfg.get("architecture") or cfg.get("arch") or "")
+    score = get_compute_score(cfg)
 
     if score <= SMALL_CEILING:
         return "SMALL"
@@ -86,6 +97,34 @@ def get_tier(cfg: dict) -> str:
 
 
 _TIER_TO_SLOTS = {"SMALL": SMALL_SLOTS, "MEDIUM": MEDIUM_SLOTS, "LARGE": LARGE_SLOTS}
+
+
+# ── Tiers de DURACIÓN (por epochs) ────────────────────────────────────────────
+# Ortogonales al tier de compute: `epochs` no afecta a la utilización simultánea
+# de la GPU (y por eso no entra en compute_score), pero sí al tiempo de pared.
+# Solo se usan para decidir QUÉ experimento coger antes, nunca cuántos slots.
+#   FAST   : ep < 3          (en los grids típicos: ep=1)
+#   MEDIUM : 3 <= ep <= 10   (ep=3, ep=10)
+#   SLOW   : ep > 10         (ep=20)
+FAST_EPOCHS_BELOW = 3
+MEDIUM_EPOCHS_MAX = 10
+
+_SPEED_RANK = {"FAST": 0, "MEDIUM": 1, "SLOW": 2}
+
+
+def get_speed_tier(cfg: dict) -> str:
+    """Retorna 'FAST', 'MEDIUM' o 'SLOW' según `epochs`."""
+    ep = _int(cfg.get("epochs", 1), 1)
+    if ep < FAST_EPOCHS_BELOW:
+        return "FAST"
+    if ep <= MEDIUM_EPOCHS_MAX:
+        return "MEDIUM"
+    return "SLOW"
+
+
+def get_speed_rank(cfg: dict) -> int:
+    """0 (FAST) / 1 (MEDIUM) / 2 (SLOW) — ordenable directamente."""
+    return _SPEED_RANK[get_speed_tier(cfg)]
 
 
 def get_slots_needed(cfg: dict) -> int:
