@@ -43,7 +43,6 @@ sys.path.insert(0, str(HERE))
 
 from naming import make_exp_name
 from api_client import BackendClient
-from local_db import LocalDB
 
 
 def load_yaml(path: str) -> dict:
@@ -79,23 +78,18 @@ def build_grid(cfg: dict) -> list[dict]:
     return out
 
 
-def register_grid(client: BackendClient, local: LocalDB, dataset: str,
+def register_grid(client: BackendClient, dataset: str,
                   grid: list[dict], chunk: int = 200) -> tuple[int, int]:
-    """Idempotent populate of backend AND local SQLite. Bulk on both sides:
-    - Backend: chunked POST /experiments/bulk (one HTTP call per chunk).
-    - Local:   single executemany INSERT OR IGNORE in a transaction.
+    """Idempotent populate of the backend: chunked POST /experiments/bulk
+    (one HTTP call per chunk).
     Returns (inserted, skipped) as reported by the backend."""
     if not grid:
         return 0, 0
     items_backend: list[dict] = []
-    items_local: list[tuple[str, str, str, dict]] = []
     for c in grid:
         name = make_exp_name(c)
         arch = c.get("architecture", "LSTM")
         items_backend.append({"exp_name": name, "architecture": arch, "config": c})
-        items_local.append((name, arch, dataset, c))
-
-    local.bulk_upsert_pending(items_local)
 
     total_ins, total_skip = 0, 0
     for i in range(0, len(items_backend), chunk):
@@ -217,15 +211,14 @@ def _fetch_all(client: BackendClient, status: str,
 
 def _run_one_task(name: str, cfg: dict, device: str, dataset: str,
                   base_url: str, agent_id: str, api_key: str | None,
-                  checkpoint_every: int, local_db_path: str) -> None:
-    """Subproceso: ejecuta un experimento ya claim-eado y reporta al backend + local."""
+                  checkpoint_every: int) -> None:
+    """Subproceso: ejecuta un experimento ya claim-eado y reporta al backend."""
     # Import torch inside the child to keep CUDA init isolated per process.
     import torch  # noqa: F401
     from runner_adapter import run_with_backend
 
     client = BackendClient(base_url=base_url, dataset=dataset, agent_id=agent_id,
                            api_key=api_key)
-    local = LocalDB(local_db_path)
 
     print(f"[{device}] ▶  {name}", flush=True)
     t0 = time.time()
@@ -240,7 +233,6 @@ def _run_one_task(name: str, cfg: dict, device: str, dataset: str,
             checkpoints_buf.append({"step": step, "elapsed_s": elapsed, "metrics": m})
 
         def on_finish(final_m: dict[str, float], duration: float):
-            local.save_completed(name, final_m, duration, checkpoints_buf)
             client.finish(name, final_m, duration, checkpoints=checkpoints_buf)
             print(f"[{device}]   saved {len(checkpoints_buf)} checkpoints", flush=True)
 
@@ -255,7 +247,6 @@ def _run_one_task(name: str, cfg: dict, device: str, dataset: str,
         dur = time.time() - t0
         print(f"[{device}] ✓  {name}  ({dur:.1f}s)", flush=True)
     except KeyboardInterrupt:
-        local.mark_failed(name, "KeyboardInterrupt")
         try:
             client.fail(name, "KeyboardInterrupt")
         except Exception:
@@ -265,7 +256,6 @@ def _run_one_task(name: str, cfg: dict, device: str, dataset: str,
         tb = traceback.format_exc()
         msg = f"{e}\n{tb[:3000]}"
         print(f"[{device}] ✗  {name}: {e}", flush=True)
-        local.mark_failed(name, msg)
         try:
             client.fail(name, msg)
         except Exception as fe:
@@ -275,7 +265,6 @@ def _run_one_task(name: str, cfg: dict, device: str, dataset: str,
 def worker_main(device: str, agent_id: str, dataset: str, base_url: str,
                 checkpoint_every: int, poll_interval: float,
                 owned_filter: list[str] | None,
-                local_db_path: str,
                 consume_any: bool,
                 api_key: str | None,
                 max_slots: int,
@@ -289,7 +278,6 @@ def worker_main(device: str, agent_id: str, dataset: str, base_url: str,
 
     client = BackendClient(base_url=base_url, dataset=dataset, agent_id=agent_id,
                            api_key=api_key)
-    local = LocalDB(local_db_path)
     pid = os.getpid()
     owned_set = set(owned_filter) if owned_filter is not None else None
     mode = "consume-any" if consume_any else "owned-only"
@@ -427,9 +415,6 @@ def worker_main(device: str, agent_id: str, dataset: str, base_url: str,
                 if claimed is None:
                     continue  # otro agent se lo llevó
 
-                local.upsert_pending(name, cfg.get("architecture", "LSTM"), dataset, cfg)
-                local.mark_running(name, agent_id, device)
-
                 with cond:
                     available_slots -= slots_needed
                     if slots_needed == 1:
@@ -445,7 +430,7 @@ def worker_main(device: str, agent_id: str, dataset: str, base_url: str,
                 fut = executor.submit(
                     _run_one_task,
                     name, cfg, device, dataset, base_url, agent_id,
-                    api_key, checkpoint_every, local_db_path,
+                    api_key, checkpoint_every,
                 )
                 fut.add_done_callback(release_cb(slots_needed, will_be_transformer, will_be_heavy_small))
                 launched_any = True
@@ -664,7 +649,6 @@ def main():
     consume_any = bool(cfg.get("consume_any", True))
     pick_order = _resolve_pick_order(cfg.get("pick_order"))
     candidate_cache_s = float(cfg.get("candidate_cache_s", DEFAULT_CANDIDATE_CACHE_S))
-    local_db_path = str(cfg.get("local_db_path") or (HERE / f"local_{dataset}.db"))
     api_key = cfg.get("api_key") or os.environ.get("BACKEND_API_KEY") or None
 
     # Slots per device: default global + override por device.
@@ -677,18 +661,14 @@ def main():
 
     client = BackendClient(base_url=backend_url, dataset=dataset, agent_id=agent_id,
                            api_key=api_key)
-    local = LocalDB(local_db_path)
     print(f"[agent] id={agent_id} backend={backend_url} dataset={dataset} "
           f"devices={devices} consume_any={consume_any}", flush=True)
     print(f"[agent] slots/device: {slots_for}", flush=True)
     print(f"[agent] pick_order: {pick_order} (candidate_cache_s={candidate_cache_s})", flush=True)
-    print(f"[agent] local mirror: {local_db_path}", flush=True)
 
     if args.status:
         print("[agent] backend stats:")
         print(json.dumps(client.stats(), indent=2))
-        print("[agent] local mirror stats:")
-        print(json.dumps(local.summary(), indent=2))
         return
 
     if args.summary:
@@ -781,14 +761,9 @@ def main():
 
     skip_register = args.no_register or args.consume_only
     if not skip_register and grid:
-        ins, skip = register_grid(client, local, dataset, grid)
+        ins, skip = register_grid(client, dataset, grid)
         print(f"[agent] registered: inserted={ins} skipped(existing)={skip}", flush=True)
-    elif grid:
-        local.bulk_upsert_pending([
-            (make_exp_name(c), c.get("architecture", "LSTM"), dataset, c)
-            for c in grid
-        ])
-    else:
+    elif not grid:
         print("[agent] no local grid — running as pure consumer", flush=True)
 
     if args.register_only:
@@ -809,7 +784,7 @@ def main():
                        args=(d, agent_id, dataset, backend_url,
                              checkpoint_every, poll_interval,
                              list(owned) if owned else None,
-                             local_db_path, consume_any, api_key,
+                             consume_any, api_key,
                              slots_for[d], pick_order, candidate_cache_s),
                        name=f"worker-{d}")
         p.start()
@@ -831,7 +806,6 @@ def main():
         print(f"[agent] backend stats: {json.dumps(client.stats())}", flush=True)
     except Exception as e:
         print(f"[agent] backend stats unavailable: {e}", flush=True)
-    print(f"[agent] local stats:   {json.dumps(local.summary())}", flush=True)
 
 
 if __name__ == "__main__":

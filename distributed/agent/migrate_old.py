@@ -30,7 +30,6 @@ sys.path.insert(0, str(HERE))
 
 from naming import make_exp_name
 from api_client import BackendClient, BackendError
-from local_db import LocalDB
 
 # Final-metric keys produced by the old runner (see experiment_system/runner.py).
 METRIC_KEYS = (
@@ -124,11 +123,9 @@ def main():
     dataset = args.dataset or cfg["dataset"]
     backend_url = cfg["backend_url"]
     api_key = cfg.get("api_key") or os.environ.get("BACKEND_API_KEY") or None
-    local_db_path = str(cfg.get("local_db_path") or (HERE / f"local_{dataset}.db"))
 
     client = BackendClient(base_url=backend_url, dataset=dataset,
                            agent_id="migrator", api_key=api_key)
-    local = LocalDB(local_db_path)
 
     src = Path(args.source_db).expanduser().resolve()
     if not src.exists():
@@ -173,15 +170,14 @@ def main():
             print(f"[dry] {new_name}  metrics={len(final_metrics)} ckpts={len(ckpts)}")
             continue
 
-        # Skip if already done in our local mirror — avoids inserting duplicate
+        # Skip if the backend already has it as done — avoids inserting duplicate
         # checkpoint rows on a re-run of this script.
-        existing_local = local.get(new_name)
-        if existing_local and existing_local.get("status") == "done":
+        existing_remote = client.get(new_name)
+        if existing_remote and existing_remote.get("status") == "done":
             skipped_done += 1
             continue
 
         # 1) create on backend (idempotent: 409 → already existed, that's fine).
-        local.upsert_pending(new_name, arch, dataset, cfg_dict)
         try:
             ok, _ = client.create(new_name, arch, cfg_dict)
             if ok:
@@ -199,12 +195,10 @@ def main():
             continue
         try:
             client.finish(new_name, final_metrics, duration, checkpoints=ckpts or None)
-            local.save_completed(new_name, final_metrics, duration, ckpts)
             finished += 1
         except BackendError as e:
             if e.status == 409:
-                # Already done remotely — bring local up to speed and move on.
-                local.save_completed(new_name, final_metrics, duration, ckpts)
+                # Already done remotely — nothing to do.
                 skipped_done += 1
             else:
                 print(f"  ERR finish {new_name}: {e}", file=sys.stderr)

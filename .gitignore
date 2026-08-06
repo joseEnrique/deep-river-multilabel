@@ -114,8 +114,10 @@ activemq-data/
 .env
 .envrc
 .venv
+.venv2
 env/
 venv/
+backup/
 ENV/
 env.bak/
 venv.bak/
@@ -174,7 +176,8 @@ experiment_system/results/
 # Use distributed/agent/config.example.yaml as a template.
 distributed/agent/config.yaml
 
-# Local SQLite mirror del agent (offline log; se recrea al arrancar).
+# Mirror SQLite local del agent — eliminado; se ignoran los restos en disco.
 distributed/agent/local_*.db
 distributed/agent/local_*.db-shm
 distributed/agent/local_*.db-wal
+config-*

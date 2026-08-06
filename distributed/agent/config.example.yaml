@@ -22,17 +22,37 @@ max_slots_per_device: 4
 #   cuda:0: 4
 #   cuda:1: 2
 
+# Orden en que cada worker elige entre los experimentos pendientes (dentro de
+# la preferencia por device, que sigue mandando primero):
+#   speed_asc (default) → primero los rápidos, por tier de duración según
+#                         `epochs`:  FAST ep≤3  →  MEDIUM 3<ep<10  →  SLOW ep≥10.
+#                         A igualdad de tier, modelo más pequeño primero.
+#                         Con speed_*, el tier manda POR ENCIMA de la afinidad
+#                         de device: un ep=1 de otra GPU adelanta a un ep=20
+#                         asignado a ésta.
+#   speed_desc          → los lentos primero (arrancar ya los runs largos).
+#   size_asc            → solo por tamaño de modelo (compute_score = hd² · nl,
+#                         + ws² · 0.5 en Transformer), ignorando epochs.
+#   size_desc           → solo por tamaño, los grandes primero.
+#   slots               → comportamiento antiguo: solo por slots_needed
+#                         (SMALL/MEDIUM → LARGE), sin desempate.
+# No afecta a cuántos slots consume nada: solo al orden de elección.
+pick_order: speed_asc
+
+# Cada worker se trae la cola de pending ENTERA (paginada) para poder ordenarla
+# de verdad; el backend la sirve por `created_at` asc, así que una sola página
+# ordenaría una ventana arbitraria del grid. Como son varios MB, se cachea este
+# número de segundos en vez de refetchear en cada vuelta del bucle. Súbelo si
+# el backend está lejos y hay muchos workers; bájalo para reaccionar antes a
+# experimentos recién registrados.
+candidate_cache_s: 60
+
 
 # If true (default), each dispatcher claims ANY pending experiment from the
 # dataset (even if registered by another agent). The `device` field on a
 # registered config is used as a SOFT preference for routing, never a hard
 # filter. Set to false to restrict this agent to experiments it registered.
 consume_any: true
-
-# Local SQLite mirror — every state change (register, claim, checkpoint,
-# finish, fail) is also written here. Acts as an offline log if the backend
-# is unavailable. Defaults to ./local_<dataset>.db
-local_db_path: null
 
 checkpoint_every: 1000
 poll_interval: 5         # seconds between empty-poll cycles

@@ -87,7 +87,7 @@ TOPLEVEL = dict(
     backend_url="http://13.37.80.70:8080", api_key="Golaso1992?", agent_id=None,
     devices=["cuda:0", "cuda:1"], max_slots_per_device=4,
     slots_per_device={"cuda:0": 4, "cuda:1": 2}, consume_any=True,
-    local_db_path=None, checkpoint_every=1000, poll_interval=5,
+    checkpoint_every=1000, poll_interval=5,
 )
 
 grand = 0
