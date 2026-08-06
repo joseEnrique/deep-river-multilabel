@@ -137,6 +137,43 @@ Create one experiment. Body:
 - `201` → the created document
 - `409` if `exp_name` already exists
 
+## `POST .../claim-next`
+
+Pick **and** claim the best pending/failed experiment in a single atomic
+operation. This is what agents use to pull work: one small request per
+launch instead of downloading the whole pending queue to sort it locally.
+
+Because it is a `findOneAndUpdate`, two agents can never receive the same
+document — there is no claim race and nothing to retry.
+
+Body:
+
+```jsonc
+{
+  "agent_id": "megatron",              // or the X-Agent-ID header
+  "device": "cuda:0",                  // recorded on the claimed experiment
+  "sort": "config.epochs:asc,config.hidden_dim:asc",   // optional
+  "prefer_device": "cuda:0"            // optional soft affinity
+}
+```
+
+- `sort` is a comma-separated list of `path[:asc|desc]`. Direction defaults
+  to `asc`. Paths are restricted to `[A-Za-z0-9_.]` — anything else is a
+  `400`, so an operator cannot be smuggled into the sort document.
+- `prefer_device` restricts the claim to experiments whose registered
+  `config.device` matches. The agent calls with it first and retries without
+  it on `404`, which reproduces "prefer this GPU, but take anything".
+
+Responses:
+
+- `200` → the claimed experiment, already in `running`
+- `404` → nothing claimable (the agent's "queue empty" signal)
+- `400` → missing `agent_id`, malformed JSON, or an invalid sort key
+
+**Indexes.** The sorted claim needs `{status:1, "config.epochs":1, ...}`,
+otherwise Mongo does a blocking in-memory sort (capped at 32 MB) over the
+whole pending queue. The server creates the indexes it needs at startup.
+
 ## `POST .../experiments/bulk`
 
 Insert many. Body: `{ "experiments": [ { exp_name, architecture, config }, ... ] }`.

@@ -47,6 +47,19 @@ type ClaimRequest struct {
 	Device  string `json:"device,omitempty"`
 }
 
+// ClaimNextRequest asks the backend to pick AND claim the best pending
+// experiment in one atomic step, so agents never race for the same document.
+//
+//	Sort:          "config.epochs:asc,config.hidden_dim:asc" (server-side ordering)
+//	PreferDevice:  soft affinity — only claim experiments registered for this
+//	               device. The agent retries without it when this returns 404.
+type ClaimNextRequest struct {
+	AgentID      string `json:"agent_id"`
+	Device       string `json:"device,omitempty"`
+	Sort         string `json:"sort,omitempty"`
+	PreferDevice string `json:"prefer_device,omitempty"`
+}
+
 type CheckpointRequest struct {
 	Step     int                `json:"step"`
 	ElapsedS float64            `json:"elapsed_s"`

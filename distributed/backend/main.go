@@ -26,6 +26,26 @@ func main() {
 	}
 	defer store.Close(context.Background())
 
+	// Indexes for the hot paths. Built in the background and one dataset at a
+	// time: on a 240k-document collection this is heavy, and doing it inline
+	// would both delay startup and hit Mongo with everything at once.
+	// A failure is not fatal — the server still serves, just slower.
+	go func() {
+		datasets, derr := store.ListDatasets(ctx)
+		if derr != nil {
+			log.Printf("index setup: cannot list datasets: %v", derr)
+			return
+		}
+		for _, ds := range datasets {
+			start := time.Now()
+			if ierr := store.EnsureIndexes(ctx, ds); ierr != nil {
+				log.Printf("index setup: %s: %v", ds, ierr)
+			} else {
+				log.Printf("index setup: %s ok (%s)", ds, time.Since(start).Round(time.Millisecond))
+			}
+		}
+	}()
+
 	h := &Handlers{Store: store}
 
 	r := chi.NewRouter()
@@ -34,6 +54,12 @@ func main() {
 	r.Use(middleware.Logger)
 	r.Use(middleware.Recoverer)
 	r.Use(middleware.Timeout(60 * time.Second))
+	// Hard ceiling on in-flight requests. This is what guarantees Mongo is
+	// never asked to do more than `cfg.MaxInFlight` things at once, however
+	// many agents connect. Excess requests wait in the backlog; if that fills
+	// too, the client gets a 503 — which BackendClient already retries with
+	// backoff, so the load sheds instead of piling up.
+	r.Use(middleware.ThrottleBacklog(cfg.MaxInFlight, cfg.Backlog, 30*time.Second))
 	r.Use(cors.Handler(cors.Options{
 		AllowedOrigins:   []string{"*"},
 		AllowedMethods:   []string{"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"},
@@ -56,6 +82,7 @@ func main() {
 		r.Get("/experiments", h.ListExperiments)
 		r.Post("/experiments", h.CreateExperiment)
 		r.Post("/experiments/bulk", h.BulkCreate)
+		r.Post("/claim-next", h.ClaimNextExperiment)
 
 		r.Route("/cube", func(r chi.Router) {
 			r.Get("/metrics", h.CubeMetrics)

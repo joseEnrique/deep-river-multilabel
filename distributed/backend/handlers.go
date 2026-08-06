@@ -274,6 +274,82 @@ func (h *Handlers) ClaimExperiment(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, exp)
 }
 
+// validSortPath keeps the sort spec to plain BSON paths so a caller cannot
+// smuggle operators into the sort document.
+func validSortPath(p string) bool {
+	if p == "" || len(p) > 128 {
+		return false
+	}
+	for _, r := range p {
+		ok := r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' ||
+			r >= '0' && r <= '9' || r == '_' || r == '.'
+		if !ok {
+			return false
+		}
+	}
+	return true
+}
+
+// parseSort turns "config.epochs:asc,config.hidden_dim:desc" into a bson.D.
+// Direction is optional and defaults to ascending.
+func parseSort(s string) (bson.D, error) {
+	out := bson.D{}
+	for _, part := range strings.Split(s, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		kv := strings.SplitN(part, ":", 2)
+		key := strings.TrimSpace(kv[0])
+		if !validSortPath(key) {
+			return nil, fmt.Errorf("invalid sort key: %q", key)
+		}
+		dir := 1
+		if len(kv) == 2 && strings.EqualFold(strings.TrimSpace(kv[1]), "desc") {
+			dir = -1
+		}
+		out = append(out, bson.E{Key: key, Value: dir})
+	}
+	return out, nil
+}
+
+func (h *Handlers) ClaimNextExperiment(w http.ResponseWriter, r *http.Request) {
+	dataset := chi.URLParam(r, "dataset")
+	var req ClaimNextRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid json: "+err.Error())
+		return
+	}
+	if req.AgentID == "" {
+		req.AgentID = r.Header.Get("X-Agent-ID")
+	}
+	if req.AgentID == "" {
+		writeErr(w, http.StatusBadRequest, "agent_id is required")
+		return
+	}
+
+	sortDoc, err := parseSort(req.Sort)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	extra := bson.M{}
+	if req.PreferDevice != "" {
+		extra["config.device"] = req.PreferDevice
+	}
+
+	exp, err := h.Store.ClaimNext(r.Context(), dataset, req.AgentID, req.Device, sortDoc, extra)
+	if err != nil {
+		if mapErr(w, err) {
+			return
+		}
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, exp)
+}
+
 func (h *Handlers) AppendCheckpoint(w http.ResponseWriter, r *http.Request) {
 	dataset := chi.URLParam(r, "dataset")
 	name := chi.URLParam(r, "name")

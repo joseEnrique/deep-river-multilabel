@@ -118,95 +118,47 @@ def _resolve_pick_order(value) -> str:
     return DEFAULT_PICK_ORDER
 
 
-def _order_candidates(candidates: list[dict], device: str,
-                      owned: set[str] | None,
-                      pick_order: str = DEFAULT_PICK_ORDER) -> list[dict]:
+# pick_order → sort de servidor (BSON paths, se los pasamos a `claim-next`).
+#
+# El orden lo aplica Mongo sobre la cola entera, no el agente sobre una ventana:
+# `config.epochs` es incluso más fino que el tier FAST/MEDIUM/SLOW que usaba la
+# versión anterior (ordena 1 → 3 → 10 → 20 en vez de agrupar en tres cubos).
+#
+# `compute_score` (hd²·nl) no está almacenado, pero ordenar por hidden_dim y
+# luego num_layers da el mismo orden en la práctica: hd va al cuadrado y domina.
+_SORT_BY_PICK_ORDER = {
+    "speed_asc":  "config.epochs:asc,config.hidden_dim:asc,config.num_layers:asc",
+    "speed_desc": "config.epochs:desc,config.hidden_dim:asc,config.num_layers:asc",
+    "size_asc":   "config.hidden_dim:asc,config.num_layers:asc,config.epochs:asc",
+    "size_desc":  "config.hidden_dim:desc,config.num_layers:desc,config.epochs:asc",
+    "slots":      "config.hidden_dim:asc,config.num_layers:asc",
+}
+
+
+def sort_spec_for(pick_order: str) -> str:
+    """Sort string que se manda a `claim-next` para un `pick_order` dado."""
+    return _SORT_BY_PICK_ORDER.get(pick_order, _SORT_BY_PICK_ORDER[DEFAULT_PICK_ORDER])
+
+
+# Tope del retroceso cuando no hay trabajo. Con el grid terminado, los workers
+# que aún tienen tareas en vuelo pasan a preguntar cada 2 minutos en vez de
+# cada `poll_interval`, que es lo que evita machacar al backend sin motivo.
+MAX_IDLE_BACKOFF_S = 120.0
+
+
+def claim_with_backoff(client: BackendClient, device: str, sort_spec: str,
+                       poll_interval: float):
+    """Reclama el siguiente experimento: primero con afinidad de device, luego
+    sin ella.
+
+    Son dos peticiones como mucho, y solo cuando hay un slot libre — es decir,
+    como mucho una vez por lanzamiento. El reintento sin filtro solo ocurre si
+    la afinidad se agotó, así que en régimen normal es una sola petición.
     """
-    Soft-preference ordering for what a worker on `device` should try first.
-
-    Bucket de afinidad (device/owned):
-      1. exps in this agent's `owned` set whose registered config.device matches
-      2. any exp whose registered config.device matches this worker's device
-      3. exps in this agent's `owned` set
-      4. anything else (so empty agents still consume foreign work)
-
-    IMPORTANTE: con "speed_asc"/"speed_desc" el tier de velocidad va DELANTE del
-    bucket, no dentro. Si no, el bucket manda y un CNN ep=20 asignado a esta GPU
-    adelanta a un LSTM ep=1 asignado a otra — justo lo contrario de "primero lo
-    rápido". Con "size_*"/"slots" el bucket sigue mandando (comportamiento
-    histórico).
-
-    Criterio dentro del bucket (o dentro del tier), según `pick_order`:
-      • "speed_asc"  (DEFAULT): tier de duración por `epochs` ascendente —
-        FAST (ep≤3) → MEDIUM (3<ep<10) → SLOW (ep≥10); a igualdad de tier,
-        modelo más pequeño primero (`compute_score`). Vacía primero lo barato,
-        así los resultados llegan pronto y los runs largos quedan al final.
-      • "speed_desc" : tier de duración descendente — SLOW primero (útil para
-        arrancar los runs largos cuanto antes si el grid se va a dejar toda la
-        noche); dentro del tier, sigue prefiriendo el modelo más pequeño.
-      • "size_asc"   : solo `compute_score` ascendente, ignorando epochs.
-      • "size_desc"  : solo `compute_score` descendente.
-      • "slots"      : comportamiento histórico, `slots_needed` ascendente
-        (SMALL/MEDIUM → LARGE) sin desempate. P.ej. en cuda:0 (4 slots)
-        prefiere 2 MEDIUM (4 slots, 2 tareas) antes que 1 LARGE (4 slots,
-        1 tarea); los LARGE se cogen cuando ya no quedan candidatos más
-        pequeños o no caben más.
-
-    Ninguna opción cambia cuántos slots consume un experimento ni las reglas de
-    admisión: solo el orden en que se intentan.
-    """
-    from slots import get_slots_needed, get_compute_score, get_speed_rank
-
-    def key(exp: dict):
-        cfg = exp.get("config") or {}
-        cfg_dev = cfg.get("device")
-        is_owned = owned is not None and exp["exp_name"] in owned
-        if is_owned and cfg_dev == device:
-            b = 0
-        elif cfg_dev == device:
-            b = 1
-        elif is_owned:
-            b = 2
-        else:
-            b = 3
-        slots = float(get_slots_needed(cfg))
-        if pick_order == "speed_asc":
-            return (float(get_speed_rank(cfg)), b, get_compute_score(cfg), slots)
-        if pick_order == "speed_desc":
-            return (-float(get_speed_rank(cfg)), b, get_compute_score(cfg), slots)
-        if pick_order == "size_asc":
-            return (b, 0.0, get_compute_score(cfg), slots)
-        if pick_order == "size_desc":
-            return (b, 0.0, -get_compute_score(cfg), slots)
-        return (b, 0.0, slots, 0.0)
-    return sorted(candidates, key=key)
-
-
-# El backend sirve `GET /experiments` ordenado por `created_at` asc y paginado.
-# Si solo pedimos la primera página, `pick_order` ordena una ventana arbitraria
-# (la parte más vieja del grid), no la cola entera: los ep=1 registrados después
-# nunca se ven y el agente parece "terminar una arquitectura antes de saltar a
-# la siguiente". Paginamos hasta agotar y cacheamos el resultado, porque la cola
-# completa son ~10 MB y no se puede refetchear en cada vuelta del bucle.
-CANDIDATE_PAGE = 2000
-CANDIDATE_MAX = 200_000
-DEFAULT_CANDIDATE_CACHE_S = 60.0
-
-
-def _fetch_all(client: BackendClient, status: str,
-               page: int = CANDIDATE_PAGE, cap: int = CANDIDATE_MAX) -> list[dict]:
-    """Pagina `client.list(status=...)` hasta agotar la cola (o llegar a `cap`)."""
-    out: list[dict] = []
-    offset = 0
-    while len(out) < cap:
-        batch = client.list(status=status, limit=page, offset=offset)
-        out.extend(batch)
-        if len(batch) < page:
-            break
-        offset += page
-    if len(out) >= cap:
-        print(f"[agent] aviso: cola '{status}' truncada a {cap} candidatos", flush=True)
-    return out
+    exp = client.claim_next(device=device, sort=sort_spec, prefer_device=device)
+    if exp is None:
+        exp = client.claim_next(device=device, sort=sort_spec)
+    return exp
 
 
 def _run_one_task(name: str, cfg: dict, device: str, dataset: str,
@@ -268,10 +220,13 @@ def worker_main(device: str, agent_id: str, dataset: str, base_url: str,
                 consume_any: bool,
                 api_key: str | None,
                 max_slots: int,
-                pick_order: str = DEFAULT_PICK_ORDER,
-                candidate_cache_s: float = DEFAULT_CANDIDATE_CACHE_S) -> None:
+                pick_order: str = DEFAULT_PICK_ORDER) -> None:
     """Despachador con slots: hasta `max_slots` experimentos concurrentes en `device`.
-    SMALL/MEDIUM=2 slots, LARGE=4 slots (slots.get_slots_needed). Calcado del scheduler local."""
+    SMALL/MEDIUM=2 slots, LARGE=4 slots (slots.get_slots_needed).
+
+    El siguiente experimento lo elige y reclama el backend en una sola operación
+    atómica (`claim-next`), así que no hay cola cacheada ni carreras entre
+    agentes por el mismo documento."""
     import threading
     import concurrent.futures
     from slots import get_slots_needed
@@ -279,55 +234,32 @@ def worker_main(device: str, agent_id: str, dataset: str, base_url: str,
     client = BackendClient(base_url=base_url, dataset=dataset, agent_id=agent_id,
                            api_key=api_key)
     pid = os.getpid()
-    owned_set = set(owned_filter) if owned_filter is not None else None
-    mode = "consume-any" if consume_any else "owned-only"
-    print(f"[{device}] worker started (pid={pid}, agent={agent_id}, mode={mode}, "
-          f"max_slots={max_slots}, pick_order={pick_order})", flush=True)
+    sort_spec = sort_spec_for(pick_order)
+    if not consume_any:
+        # `claim-next` ordena y reclama en el servidor, que no sabe qué configs
+        # registró este agente. El filtro owned-only ya no es aplicable.
+        print(f"[{device}] aviso: consume_any=false ya no se soporta con "
+              f"claim-next; consumiendo cualquier experimento pendiente",
+              flush=True)
+    print(f"[{device}] worker started (pid={pid}, agent={agent_id}, "
+          f"max_slots={max_slots}, pick_order={pick_order}, sort={sort_spec})",
+          flush=True)
 
     available_slots = max_slots
-    # Contadores:
-    # - smalls_running: cualquier arch en tier SMALL (tope absoluto 3).
-    # - heavy_smalls_running: SMALL con past_history>=10 (secuencias largas
-    #   que consumen más memoria y compute aunque caigan en tier SMALL; tope 2).
-    # - transformer_smalls / transformer_others: por tier para reglas de
-    #   saturación con Transformer (2 MEDIUM Tr OK, 4 SMALL Tr NO).
-    smalls_running = 0
-    heavy_smalls_running = 0
-    transformer_smalls_running = 0
-    transformer_others_running = 0
     cond = threading.Condition()
 
-    def is_heavy_small(c: dict) -> bool:
-        try:
-            return int(c.get("past_history", 1)) >= 10
-        except (TypeError, ValueError):
-            return False
-
-    def release_cb(slots_used: int, was_transformer: bool, was_heavy_small: bool):
+    def release_cb(slots_used: int):
         def _cb(_fut):
-            nonlocal available_slots, smalls_running, heavy_smalls_running
-            nonlocal transformer_smalls_running, transformer_others_running
+            nonlocal available_slots
             with cond:
                 available_slots += slots_used
-                if slots_used == 1:
-                    smalls_running = max(0, smalls_running - 1)
-                    if was_heavy_small:
-                        heavy_smalls_running = max(0, heavy_smalls_running - 1)
-                if was_transformer:
-                    if slots_used == 1:
-                        transformer_smalls_running -= 1
-                    else:
-                        transformer_others_running -= 1
                 cond.notify_all()
         return _cb
 
-    # Cola de candidatos cacheada: la cola completa son ~10 MB, así que se
-    # refresca cada `candidate_cache_s` en vez de en cada vuelta. `taken` son
-    # los nombres ya reclamados (por nosotros o por otro agente) que no hay que
-    # reintentar hasta el siguiente refresco.
-    cache: list[dict] = []
-    cache_ts = 0.0
-    taken: set[str] = set()
+    # Retroceso exponencial para no martillear al backend cuando no hay nada
+    # que coger. Sin esto, N workers ociosos golpearían Mongo cada
+    # `poll_interval` segundos indefinidamente al terminar el grid.
+    idle_backoff = poll_interval
 
     with concurrent.futures.ProcessPoolExecutor(max_workers=max_slots) as executor:
         while True:
@@ -335,114 +267,46 @@ def worker_main(device: str, agent_id: str, dataset: str, base_url: str,
                 while available_slots == 0:
                     cond.wait()
 
-            now = time.monotonic()
-            refreshed = False
-            if not cache or (now - cache_ts) >= candidate_cache_s:
-                items = _fetch_all(client, "pending") + _fetch_all(client, "failed")
-                if not consume_any and owned_set is not None:
-                    items = [c for c in items if c["exp_name"] in owned_set]
-                cache = _order_candidates(items, device, owned_set, pick_order)
-                cache_ts = now
-                taken.clear()
-                refreshed = True
-                head = cache[0]["exp_name"] if cache else "-"
-                print(f"[{device}] queue refreshed: {len(cache)} candidates, "
-                      f"next={head}", flush=True)
+            # El backend elige Y reclama en una sola operación atómica. Primero
+            # con afinidad de device (preferencia blanda: los configs registrados
+            # para esta GPU), y si no hay ninguno, cualquiera.
+            exp = claim_with_backoff(client, device, sort_spec, poll_interval)
 
-            candidates = [c for c in cache if c["exp_name"] not in taken]
-
-            if not candidates:
-                if not refreshed:
-                    # La caché está agotada pero puede estar rancia: fuerza
-                    # refetch en la siguiente vuelta antes de decidir salir.
-                    cache_ts = 0.0
-                    continue
+            if exp is None:
                 # Nada pendiente. Si todos los slots están libres, salimos;
                 # si hay tareas en vuelo, esperamos a que se vacíen.
                 with cond:
                     if available_slots == max_slots:
                         print(f"[{device}] nothing pending, exiting worker", flush=True)
                         return
+                time.sleep(idle_backoff)
+                idle_backoff = min(idle_backoff * 2, MAX_IDLE_BACKOFF_S)
+                continue
+
+            idle_backoff = poll_interval  # hubo trabajo: vuelve al ritmo normal
+
+            name = exp["exp_name"]
+            cfg = exp["config"]
+            slots_needed = get_slots_needed(cfg)
+
+            with cond:
+                fits = slots_needed <= available_slots
+                if fits:
+                    available_slots -= slots_needed
+
+            if not fits:
+                # Ya está reclamado, así que hay que devolverlo: si no, se
+                # quedaría en `running` sin que nadie lo ejecute.
+                client.release(name)
                 time.sleep(poll_interval)
                 continue
 
-            launched_any = False
-            for exp in candidates:
-                cfg = exp["config"]
-                slots_needed = get_slots_needed(cfg)
-
-                arch = cfg.get("architecture") or cfg.get("arch") or ""
-                will_be_transformer = (arch == "Transformer")
-
-                will_be_heavy_small = (slots_needed == 1 and is_heavy_small(cfg))
-
-                with cond:
-                    if slots_needed > available_slots:
-                        continue  # no cabe ahora; intenta el siguiente
-                    # Regla SIEMPRE: máximo 3 SMALL concurrentes en la GPU.
-                    if slots_needed == 1 and smalls_running >= 3:
-                        continue
-                    # Regla EXTRA para SMALLs caros (ph>=10): máx 2.
-                    if will_be_heavy_small and heavy_smalls_running >= 2:
-                        continue
-                    # Si ya hay heavy SMALLs corriendo, no permitir que un
-                    # MEDIUM/LARGE entre y sature la GPU al 100% (los heavy
-                    # SMALL ya consumen suficiente; sumar más arriesga OOM/
-                    # throttling). Excepción: un LARGE que ocupa exactamente
-                    # toda la GPU él solo no es el caso (cabría solo si la GPU
-                    # está vacía, controlado por slots_needed > available).
-                    if (heavy_smalls_running > 0
-                            and slots_needed > 1
-                            and (available_slots - slots_needed) < 1):
-                        continue
-                    # Reglas SOLO cuando el que entra es Transformer:
-                    #   - 2 MEDIUM Transformer (saturan al 100%, OK)
-                    #   - 1 LARGE solo (caso full_gpu trivial)
-                    #   - NO mezclar SMALL Transformer cuando se saturaría la GPU.
-                    # LSTM/MLP/CNN no-SMALL entran sin restricción (aunque haya
-                    # Transformer corriendo).
-                    if will_be_transformer:
-                        is_full_gpu = slots_needed == max_slots
-                        slots_after = available_slots - slots_needed
-                        if not is_full_gpu and slots_after < 1:
-                            new_is_small = slots_needed == 1
-                            if new_is_small or transformer_smalls_running > 0:
-                                continue
-
-                name = exp["exp_name"]
-                claimed = client.claim(name, device=device)
-                taken.add(name)  # nuestro o de otro: no reintentar en esta caché
-                if claimed is None:
-                    continue  # otro agent se lo llevó
-
-                with cond:
-                    available_slots -= slots_needed
-                    if slots_needed == 1:
-                        smalls_running += 1
-                        if will_be_heavy_small:
-                            heavy_smalls_running += 1
-                    if will_be_transformer:
-                        if slots_needed == 1:
-                            transformer_smalls_running += 1
-                        else:
-                            transformer_others_running += 1
-
-                fut = executor.submit(
-                    _run_one_task,
-                    name, cfg, device, dataset, base_url, agent_id,
-                    api_key, checkpoint_every,
-                )
-                fut.add_done_callback(release_cb(slots_needed, will_be_transformer, will_be_heavy_small))
-                launched_any = True
-
-                with cond:
-                    if available_slots == 0:
-                        break
-
-            if not launched_any:
-                # Hay candidatos pero ninguno cabe en los slots libres
-                # (ej. solo HEAVY pendientes con 1 slot libre): espera.
-                time.sleep(poll_interval)
+            fut = executor.submit(
+                _run_one_task,
+                name, cfg, device, dataset, base_url, agent_id,
+                api_key, checkpoint_every,
+            )
+            fut.add_done_callback(release_cb(slots_needed))
 
 
 # ── Cube queries (CLI helpers) ────────────────────────────────────────────────
@@ -648,7 +512,6 @@ def main():
     poll_interval = float(cfg.get("poll_interval", 5.0))
     consume_any = bool(cfg.get("consume_any", True))
     pick_order = _resolve_pick_order(cfg.get("pick_order"))
-    candidate_cache_s = float(cfg.get("candidate_cache_s", DEFAULT_CANDIDATE_CACHE_S))
     api_key = cfg.get("api_key") or os.environ.get("BACKEND_API_KEY") or None
 
     # Slots per device: default global + override por device.
@@ -664,7 +527,7 @@ def main():
     print(f"[agent] id={agent_id} backend={backend_url} dataset={dataset} "
           f"devices={devices} consume_any={consume_any}", flush=True)
     print(f"[agent] slots/device: {slots_for}", flush=True)
-    print(f"[agent] pick_order: {pick_order} (candidate_cache_s={candidate_cache_s})", flush=True)
+    print(f"[agent] pick_order: {pick_order} -> sort={sort_spec_for(pick_order)}", flush=True)
 
     if args.status:
         print("[agent] backend stats:")
@@ -785,7 +648,7 @@ def main():
                              checkpoint_every, poll_interval,
                              list(owned) if owned else None,
                              consume_any, api_key,
-                             slots_for[d], pick_order, candidate_cache_s),
+                             slots_for[d], pick_order),
                        name=f"worker-{d}")
         p.start()
         procs.append(p)

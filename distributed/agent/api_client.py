@@ -42,7 +42,13 @@ class BackendClient:
 
     def _request(self, method: str, url: str, *, json=None,
                  ok_codes: tuple[int, ...] = (200, 201, 204),
-                 retry_on: tuple[int, ...] = (502, 503, 504)) -> dict | None:
+                 retry_on: tuple[int, ...] = (429, 502, 503, 504)) -> dict | None:
+        """
+        429 está en `retry_on` a propósito: cuando el backend alcanza su tope
+        de peticiones concurrentes descarga carga con 429 + `Retry-After`. Ese
+        código significa "vuelve luego", no "esto ha fallado" — si no se
+        reintentara, saturar el backend haría caer a los agentes.
+        """
         last_err: Exception | None = None
         for attempt in range(self.retries):
             try:
@@ -53,7 +59,7 @@ class BackendClient:
                     return r.json()
                 if r.status_code in retry_on:
                     last_err = BackendError(r.status_code, r.text)
-                    time.sleep(self.backoff ** attempt)
+                    time.sleep(self._retry_delay(r, attempt))
                     continue
                 raise BackendError(r.status_code, r.text)
             except requests.RequestException as e:
@@ -62,6 +68,18 @@ class BackendClient:
         if last_err:
             raise last_err
         raise RuntimeError("unreachable")
+
+    def _retry_delay(self, response, attempt: int) -> float:
+        """Respeta `Retry-After` si el servidor lo manda; si no, backoff
+        exponencial. Se acota a 60 s para que una cabecera absurda no deje al
+        agente parado media hora."""
+        header = response.headers.get("Retry-After")
+        if header:
+            try:
+                return min(max(float(header), 0.0), 60.0)
+            except (TypeError, ValueError):
+                pass
+        return self.backoff ** attempt
 
     def health(self) -> dict:
         r = self.s.get(f"{self.base_url}/api/v1/health", timeout=self.timeout)
@@ -120,6 +138,41 @@ class BackendClient:
         except BackendError as e:
             if e.status in (404, 409):
                 return None
+            raise
+
+    def claim_next(self, device: str, sort: str | None = None,
+                   prefer_device: str | None = None) -> dict | None:
+        """Atomically pick AND claim the best pending experiment server-side.
+
+        One round trip instead of downloading the whole pending queue. Because
+        the backend uses findOneAndUpdate, two agents can never get the same
+        experiment — there is no claim race to retry.
+
+        Returns the claimed experiment, or None when nothing is claimable (404).
+        """
+        url = self._ds_url("claim-next")
+        body: dict[str, str] = {"agent_id": self.agent_id, "device": device}
+        if sort:
+            body["sort"] = sort
+        if prefer_device:
+            body["prefer_device"] = prefer_device
+        try:
+            return self._request("POST", url, json=body, ok_codes=(200,))
+        except BackendError as e:
+            if e.status == 404:
+                return None
+            raise
+
+    def release(self, exp_name: str) -> bool:
+        """running → pending. Used to hand back an experiment we claimed but
+        cannot run right now. True if released, False if it was not running."""
+        url = self._ds_url("experiments", exp_name, "release")
+        try:
+            self._request("POST", url, ok_codes=(200,))
+            return True
+        except BackendError as e:
+            if e.status in (404, 409):
+                return False
             raise
 
     def checkpoint(self, exp_name: str, step: int, elapsed_s: float, metrics: dict[str, float]) -> None:

@@ -26,11 +26,33 @@ type Store struct {
 	dbPrefix string
 }
 
+// Connection-pool bounds. The point is that Mongo can never be asked to do
+// more work than this at once, no matter how many agents show up: excess
+// requests queue on the pool instead of piling onto the server.
+const (
+	maxPoolSize            = 50
+	minPoolSize            = 5
+	maxConnIdleTime        = 5 * time.Minute
+	serverSelectionTimeout = 10 * time.Second
+	// Hard ceiling per operation. A runaway query gets killed server-side
+	// rather than holding a connection (and Mongo's resources) forever.
+	opTimeout = 55 * time.Second
+)
+
 func NewMongoStore(ctx context.Context, uri, dbPrefix string) (*Store, error) {
 	connectCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
-	client, err := mongo.Connect(connectCtx, options.Client().ApplyURI(uri))
+	opts := options.Client().ApplyURI(uri).
+		SetMaxPoolSize(maxPoolSize).
+		SetMinPoolSize(minPoolSize).
+		SetMaxConnIdleTime(maxConnIdleTime).
+		SetServerSelectionTimeout(serverSelectionTimeout).
+		SetTimeout(opTimeout).
+		SetRetryWrites(true).
+		SetRetryReads(true)
+
+	client, err := mongo.Connect(connectCtx, opts)
 	if err != nil {
 		return nil, fmt.Errorf("connect: %w", err)
 	}
@@ -61,6 +83,189 @@ func validDatasetName(d string) bool {
 		}
 	}
 	return true
+}
+
+// EnsureIndexes creates the indexes every hot path depends on. Idempotent:
+// CreateMany on an existing index is a no-op.
+//
+// Two things make these mandatory rather than nice-to-have:
+//
+//   - Without a `status` prefix, every `status=pending` query is a full
+//     collection scan (240k docs on alpi).
+//   - A sorted claim-next with no usable index makes Mongo materialise and
+//     sort the whole pending queue in memory, which it caps at 32 MB. That
+//     does not degrade — it *fails* once the queue is big enough.
+//
+// Sort direction matters: Mongo serves a sort from an index only when the
+// requested sort equals the index key pattern or its EXACT inverse. That is
+// why `speed_desc` (epochs desc, hidden_dim asc — mixed directions) needs its
+// own index and cannot reuse the `speed_asc` one.
+func (s *Store) EnsureIndexes(ctx context.Context, dataset string) error {
+	c, err := s.coll(dataset)
+	if err != nil {
+		return err
+	}
+	idx := func(name string, keys bson.D) mongo.IndexModel {
+		return mongo.IndexModel{Keys: keys, Options: options.Index().SetName(name)}
+	}
+	models := []mongo.IndexModel{
+		// ── claim-next: one index per pick_order sort shape ──────────────
+		// speed_asc (the default): epochs → hidden_dim → num_layers, all asc.
+		idx("claim_speed_asc", bson.D{
+			{Key: "status", Value: 1},
+			{Key: "config.epochs", Value: 1},
+			{Key: "config.hidden_dim", Value: 1},
+			{Key: "config.num_layers", Value: 1},
+		}),
+		// speed_desc: mixed directions, so not covered by the index above.
+		idx("claim_speed_desc", bson.D{
+			{Key: "status", Value: 1},
+			{Key: "config.epochs", Value: -1},
+			{Key: "config.hidden_dim", Value: 1},
+			{Key: "config.num_layers", Value: 1},
+		}),
+		// size_asc, and `slots` as its two-key prefix.
+		idx("claim_size_asc", bson.D{
+			{Key: "status", Value: 1},
+			{Key: "config.hidden_dim", Value: 1},
+			{Key: "config.num_layers", Value: 1},
+			{Key: "config.epochs", Value: 1},
+		}),
+		// size_desc: hidden_dim/num_layers desc but epochs asc → mixed again.
+		idx("claim_size_desc", bson.D{
+			{Key: "status", Value: 1},
+			{Key: "config.hidden_dim", Value: -1},
+			{Key: "config.num_layers", Value: -1},
+			{Key: "config.epochs", Value: 1},
+		}),
+		// Device-affinity variants: prefer_device adds an equality on
+		// config.device, which must sit before the sort keys.
+		idx("claim_device_speed_asc", bson.D{
+			{Key: "status", Value: 1},
+			{Key: "config.device", Value: 1},
+			{Key: "config.epochs", Value: 1},
+			{Key: "config.hidden_dim", Value: 1},
+			{Key: "config.num_layers", Value: 1},
+		}),
+		idx("claim_device_speed_desc", bson.D{
+			{Key: "status", Value: 1},
+			{Key: "config.device", Value: 1},
+			{Key: "config.epochs", Value: -1},
+			{Key: "config.hidden_dim", Value: 1},
+			{Key: "config.num_layers", Value: 1},
+		}),
+		idx("claim_device_size_asc", bson.D{
+			{Key: "status", Value: 1},
+			{Key: "config.device", Value: 1},
+			{Key: "config.hidden_dim", Value: 1},
+			{Key: "config.num_layers", Value: 1},
+			{Key: "config.epochs", Value: 1},
+		}),
+		idx("claim_device_size_desc", bson.D{
+			{Key: "status", Value: 1},
+			{Key: "config.device", Value: 1},
+			{Key: "config.hidden_dim", Value: -1},
+			{Key: "config.num_layers", Value: -1},
+			{Key: "config.epochs", Value: 1},
+		}),
+
+		// ── list / stats / summary ───────────────────────────────────────
+		// GET /experiments and results.csv: filter by status, sort created_at.
+		idx("list_status_created", bson.D{
+			{Key: "status", Value: 1},
+			{Key: "created_at", Value: 1},
+		}),
+		// Summary's running table: status=running sorted by started_at.
+		idx("summary_running", bson.D{
+			{Key: "status", Value: 1},
+			{Key: "started_at", Value: 1},
+		}),
+		// Summary's duration aggregate: status=done, duration_s > 0.
+		idx("summary_duration", bson.D{
+			{Key: "status", Value: 1},
+			{Key: "duration_s", Value: 1},
+		}),
+
+		// ── CSV export filters ───────────────────────────────────────────
+		idx("csv_architecture", bson.D{
+			{Key: "status", Value: 1},
+			{Key: "architecture", Value: 1},
+			{Key: "created_at", Value: 1},
+		}),
+		idx("csv_agent_device", bson.D{
+			{Key: "status", Value: 1},
+			{Key: "agent_id", Value: 1},
+			{Key: "device", Value: 1},
+		}),
+		idx("csv_loss_type", bson.D{
+			{Key: "status", Value: 1},
+			{Key: "config.loss.type", Value: 1},
+		}),
+
+		// ── cube/top on the two metrics actually reported ────────────────
+		// Other metric names fall back to a scan; these are the ones the
+		// grid is ranked by.
+		idx("top_macro_f1", bson.D{
+			{Key: "status", Value: 1},
+			{Key: "final_metrics.macro_f1", Value: 1},
+		}),
+		idx("top_subset_acc", bson.D{
+			{Key: "status", Value: 1},
+			{Key: "final_metrics.subset_acc", Value: 1},
+		}),
+	}
+	idxCtx, cancel := context.WithTimeout(ctx, 30*time.Minute)
+	defer cancel()
+	_, err = c.Indexes().CreateMany(idxCtx, models)
+	return err
+}
+
+// ClaimNext atomically picks the best pending/failed experiment according to
+// `sort` and flips it to running in a single round trip. Because Mongo's
+// FindOneAndUpdate is atomic, two agents can never receive the same document —
+// there is no claim race to retry.
+//
+// `extraFilter` is merged into the status filter (used for soft device
+// affinity: try `config.device == cuda:0` first, then fall back to no filter).
+func (s *Store) ClaimNext(ctx context.Context, dataset, agentID, device string,
+	sort bson.D, extraFilter bson.M) (*Experiment, error) {
+	c, err := s.coll(dataset)
+	if err != nil {
+		return nil, err
+	}
+	filter := bson.M{
+		"status": bson.M{"$in": []Status{StatusPending, StatusFailed}},
+	}
+	for k, v := range extraFilter {
+		filter[k] = v
+	}
+	now := time.Now().UTC()
+	opts := options.FindOneAndUpdate().SetReturnDocument(options.After)
+	if len(sort) > 0 {
+		opts = opts.SetSort(sort)
+	}
+	res := c.FindOneAndUpdate(ctx,
+		filter,
+		bson.M{"$set": bson.M{
+			"status":     StatusRunning,
+			"agent_id":   agentID,
+			"device":     device,
+			"started_at": now,
+			"updated_at": now,
+			"error":      "",
+		}},
+		opts)
+	if err := res.Err(); err != nil {
+		if errors.Is(err, mongo.ErrNoDocuments) {
+			return nil, ErrNotFound
+		}
+		return nil, err
+	}
+	var exp Experiment
+	if err := res.Decode(&exp); err != nil {
+		return nil, err
+	}
+	return &exp, nil
 }
 
 func (s *Store) Create(ctx context.Context, dataset string, exp *Experiment) error {
