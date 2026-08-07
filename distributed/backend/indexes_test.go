@@ -13,11 +13,11 @@ import (
 // _SORT_BY_PICK_ORDER in distributed/agent/agent.py — if that map changes and
 // this one does not, TestEveryPickOrderIsIndexBacked will fail on the new sort.
 var agentSortSpecs = map[string]string{
-	"speed_asc":  "config.epochs:asc,config.hidden_dim:asc,config.num_layers:asc",
-	"speed_desc": "config.epochs:desc,config.hidden_dim:asc,config.num_layers:asc",
-	"size_asc":   "config.hidden_dim:asc,config.num_layers:asc,config.epochs:asc",
-	"size_desc":  "config.hidden_dim:desc,config.num_layers:desc,config.epochs:asc",
-	"slots":      "config.hidden_dim:asc,config.num_layers:asc",
+	"speed_asc":  "config.epochs:asc,compute_score:asc",
+	"speed_desc": "config.epochs:desc,compute_score:asc",
+	"size_asc":   "compute_score:asc,config.epochs:asc",
+	"size_desc":  "compute_score:desc,config.epochs:asc",
+	"slots":      "compute_score:asc",
 }
 
 // explainFind returns the winning plan's stage names for a find+sort+limit.

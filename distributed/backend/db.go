@@ -110,32 +110,33 @@ func (s *Store) EnsureIndexes(ctx context.Context, dataset string) error {
 	}
 	models := []mongo.IndexModel{
 		// ── claim-next: one index per pick_order sort shape ──────────────
-		// speed_asc (the default): epochs → hidden_dim → num_layers, all asc.
+		// The size key is `compute_score`, not config.hidden_dim: for a
+		// Transformer the window term dominates, so hidden_dim would order
+		// a LARGE ws=500 model ahead of a MEDIUM one.
+		//
+		// speed_asc (the default): fastest first, then smallest first —
+		// speed+SMALL, then speed+MEDIUM, then speed+LARGE.
 		idx("claim_speed_asc", bson.D{
 			{Key: "status", Value: 1},
 			{Key: "config.epochs", Value: 1},
-			{Key: "config.hidden_dim", Value: 1},
-			{Key: "config.num_layers", Value: 1},
+			{Key: "compute_score", Value: 1},
 		}),
 		// speed_desc: mixed directions, so not covered by the index above.
 		idx("claim_speed_desc", bson.D{
 			{Key: "status", Value: 1},
 			{Key: "config.epochs", Value: -1},
-			{Key: "config.hidden_dim", Value: 1},
-			{Key: "config.num_layers", Value: 1},
+			{Key: "compute_score", Value: 1},
 		}),
-		// size_asc, and `slots` as its two-key prefix.
+		// size_asc, and `slots` as its single-key prefix.
 		idx("claim_size_asc", bson.D{
 			{Key: "status", Value: 1},
-			{Key: "config.hidden_dim", Value: 1},
-			{Key: "config.num_layers", Value: 1},
+			{Key: "compute_score", Value: 1},
 			{Key: "config.epochs", Value: 1},
 		}),
-		// size_desc: hidden_dim/num_layers desc but epochs asc → mixed again.
+		// size_desc: score desc but epochs asc → mixed again.
 		idx("claim_size_desc", bson.D{
 			{Key: "status", Value: 1},
-			{Key: "config.hidden_dim", Value: -1},
-			{Key: "config.num_layers", Value: -1},
+			{Key: "compute_score", Value: -1},
 			{Key: "config.epochs", Value: 1},
 		}),
 		// Device-affinity variants: prefer_device adds an equality on
@@ -144,28 +145,24 @@ func (s *Store) EnsureIndexes(ctx context.Context, dataset string) error {
 			{Key: "status", Value: 1},
 			{Key: "config.device", Value: 1},
 			{Key: "config.epochs", Value: 1},
-			{Key: "config.hidden_dim", Value: 1},
-			{Key: "config.num_layers", Value: 1},
+			{Key: "compute_score", Value: 1},
 		}),
 		idx("claim_device_speed_desc", bson.D{
 			{Key: "status", Value: 1},
 			{Key: "config.device", Value: 1},
 			{Key: "config.epochs", Value: -1},
-			{Key: "config.hidden_dim", Value: 1},
-			{Key: "config.num_layers", Value: 1},
+			{Key: "compute_score", Value: 1},
 		}),
 		idx("claim_device_size_asc", bson.D{
 			{Key: "status", Value: 1},
 			{Key: "config.device", Value: 1},
-			{Key: "config.hidden_dim", Value: 1},
-			{Key: "config.num_layers", Value: 1},
+			{Key: "compute_score", Value: 1},
 			{Key: "config.epochs", Value: 1},
 		}),
 		idx("claim_device_size_desc", bson.D{
 			{Key: "status", Value: 1},
 			{Key: "config.device", Value: 1},
-			{Key: "config.hidden_dim", Value: -1},
-			{Key: "config.num_layers", Value: -1},
+			{Key: "compute_score", Value: -1},
 			{Key: "config.epochs", Value: 1},
 		}),
 
@@ -218,6 +215,82 @@ func (s *Store) EnsureIndexes(ctx context.Context, dataset string) error {
 	defer cancel()
 	_, err = c.Indexes().CreateMany(idxCtx, models)
 	return err
+}
+
+// Tier boundaries — must match slots.py in the agent.
+const (
+	smallCeiling  = 5_000.0
+	mediumCeiling = 50_000.0
+)
+
+// computeScorePipeline reproduces slots.get_compute_score server-side:
+//
+//	score = hd² · nl                      (dense matmuls: MLP/CNN/LSTM)
+//	      + ws² · 0.5   for Transformer   (attention is O(L²))
+//
+// hd is config.hidden_dim, or the largest entry of config.hidden_dims (MLP).
+// Missing fields fall back to the same defaults the agent uses.
+func computeScorePipeline() mongo.Pipeline {
+	hd := bson.M{"$ifNull": bson.A{
+		"$config.hidden_dim",
+		bson.M{"$ifNull": bson.A{bson.M{"$max": "$config.hidden_dims"}, 32}},
+	}}
+	nl := bson.M{"$ifNull": bson.A{"$config.num_layers", 1}}
+	ws := bson.M{"$ifNull": bson.A{"$config.window_size", 1}}
+	arch := bson.M{"$ifNull": bson.A{"$architecture", "$config.architecture"}}
+
+	score := bson.M{"$let": bson.M{
+		"vars": bson.M{
+			"hd": bson.M{"$toDouble": hd},
+			"nl": bson.M{"$toDouble": nl},
+			"ws": bson.M{"$toDouble": ws},
+		},
+		"in": bson.M{"$add": bson.A{
+			bson.M{"$multiply": bson.A{"$$hd", "$$hd", "$$nl"}},
+			bson.M{"$cond": bson.A{
+				bson.M{"$eq": bson.A{arch, "Transformer"}},
+				bson.M{"$multiply": bson.A{"$$ws", "$$ws", 0.5}},
+				0.0,
+			}},
+		}},
+	}}
+
+	return mongo.Pipeline{
+		bson.D{{Key: "$set", Value: bson.M{"compute_score": score}}},
+		bson.D{{Key: "$set", Value: bson.M{"size_tier": bson.M{"$switch": bson.M{
+			"branches": bson.A{
+				bson.M{"case": bson.M{"$lte": bson.A{"$compute_score", smallCeiling}}, "then": "SMALL"},
+				bson.M{"case": bson.M{"$lte": bson.A{"$compute_score", mediumCeiling}}, "then": "MEDIUM"},
+			},
+			"default": "LARGE",
+		}}}}},
+	}
+}
+
+// BackfillScores computes compute_score/size_tier for documents registered
+// before those fields existed. Runs as one server-side pipeline update — no
+// document round-trips — and is idempotent, so it is safe to re-run.
+//
+// This matters for correctness, not just speed: in Mongo a missing field sorts
+// FIRST ascending, so un-backfilled documents would jump the queue.
+func (s *Store) BackfillScores(ctx context.Context, dataset string, onlyMissing bool) (matched, modified, missing int64, err error) {
+	c, cerr := s.coll(dataset)
+	if cerr != nil {
+		return 0, 0, 0, cerr
+	}
+	filter := bson.M{}
+	if onlyMissing {
+		filter["compute_score"] = bson.M{"$exists": false}
+	}
+	res, uerr := c.UpdateMany(ctx, filter, computeScorePipeline())
+	if uerr != nil {
+		return 0, 0, 0, uerr
+	}
+	missing, cerr2 := c.CountDocuments(ctx, bson.M{"compute_score": bson.M{"$exists": false}})
+	if cerr2 != nil {
+		return res.MatchedCount, res.ModifiedCount, 0, nil
+	}
+	return res.MatchedCount, res.ModifiedCount, missing, nil
 }
 
 // ClaimNext atomically picks the best pending/failed experiment according to

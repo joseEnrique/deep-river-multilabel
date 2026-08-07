@@ -83,6 +83,7 @@ func main() {
 		r.Post("/experiments", h.CreateExperiment)
 		r.Post("/experiments/bulk", h.BulkCreate)
 		r.Post("/claim-next", h.ClaimNextExperiment)
+		r.Post("/backfill-scores", h.BackfillScores)
 
 		r.Route("/cube", func(r chi.Router) {
 			r.Get("/metrics", h.CubeMetrics)

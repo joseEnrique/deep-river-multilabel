@@ -163,6 +163,19 @@ class BackendClient:
                 return None
             raise
 
+    def backfill_scores(self, recompute_all: bool = False) -> dict:
+        """Rellena `compute_score`/`size_tier` en los documentos registrados
+        antes de que existieran esos campos.
+
+        Es una única operación server-side (pipeline update), no un documento
+        por petición. Importa para la corrección, no solo para el orden: en
+        Mongo un campo ausente ordena PRIMERO en ascendente, así que los
+        documentos sin score se colarían al principio de la cola."""
+        url = self._ds_url("backfill-scores")
+        if recompute_all:
+            url += "?all=true"
+        return self._request("POST", url, ok_codes=(200,))
+
     def release(self, exp_name: str) -> bool:
         """running → pending. Used to hand back an experiment we claimed but
         cannot run right now. True if released, False if it was not running."""

@@ -33,6 +33,27 @@ Del lado del agente, además, hay **retroceso exponencial cuando no hay
 trabajo** (hasta 120 s): con el grid terminado, los workers ociosos dejan de
 preguntar cada `poll_interval` en vez de machacar el backend sin motivo.
 
+## Orden de la cola
+
+`claim-next` ordena por `config.epochs` y luego por `compute_score`, es decir
+**rápido+SMALL → rápido+MEDIUM → rápido+LARGE → lento+SMALL → …**
+
+`compute_score` (`hd²·nl`, más `ws²·0.5` en Transformer) se guarda en el
+documento al registrar, calculado por `slots.py` en el agente. No se ordena por
+`config.hidden_dim` porque para un Transformer el término de atención domina:
+`hd=32, ws=500` puntúa 126.024 (LARGE) frente a un LSTM `hd=128, nl=2` con
+32.768 (MEDIUM) — por `hidden_dim` el LARGE adelantaría al MEDIUM.
+
+**Tras actualizar hay que rellenar el campo una vez** en los experimentos ya
+registrados. En Mongo un campo ausente ordena *primero* en ascendente, así que
+sin esto los documentos viejos se colarían al principio de la cola:
+
+```bash
+python distributed/agent/agent.py --config <cfg> --backfill-scores
+```
+
+Es una sola operación server-side e idempotente.
+
 ## Índices
 
 Se crean al arrancar, **en segundo plano** (el servidor atiende desde el

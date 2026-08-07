@@ -82,14 +82,27 @@ def register_grid(client: BackendClient, dataset: str,
                   grid: list[dict], chunk: int = 200) -> tuple[int, int]:
     """Idempotent populate of the backend: chunked POST /experiments/bulk
     (one HTTP call per chunk).
+
+    Cada experimento lleva su `compute_score` y `size_tier` calculados aquí con
+    `slots.py`, para que el backend pueda ordenar por tamaño real de modelo sin
+    tener que reimplementar la fórmula ni aproximarla por `hidden_dim`.
+
     Returns (inserted, skipped) as reported by the backend."""
     if not grid:
         return 0, 0
+    from slots import get_compute_score, get_tier
+
     items_backend: list[dict] = []
     for c in grid:
         name = make_exp_name(c)
         arch = c.get("architecture", "LSTM")
-        items_backend.append({"exp_name": name, "architecture": arch, "config": c})
+        items_backend.append({
+            "exp_name": name,
+            "architecture": arch,
+            "config": c,
+            "compute_score": get_compute_score(c),
+            "size_tier": get_tier(c),
+        })
 
     total_ins, total_skip = 0, 0
     for i in range(0, len(items_backend), chunk):
@@ -120,18 +133,27 @@ def _resolve_pick_order(value) -> str:
 
 # pick_order → sort de servidor (BSON paths, se los pasamos a `claim-next`).
 #
-# El orden lo aplica Mongo sobre la cola entera, no el agente sobre una ventana:
-# `config.epochs` es incluso más fino que el tier FAST/MEDIUM/SLOW que usaba la
-# versión anterior (ordena 1 → 3 → 10 → 20 en vez de agrupar en tres cubos).
+# El orden lo aplica Mongo sobre la cola entera, no el agente sobre una ventana.
+# Dos claves:
 #
-# `compute_score` (hd²·nl) no está almacenado, pero ordenar por hidden_dim y
-# luego num_layers da el mismo orden en la práctica: hd va al cuadrado y domina.
+#   • `config.epochs` para la velocidad — más fino que el tier FAST/MEDIUM/SLOW
+#     (ordena 1 → 3 → 10 → 20 en vez de agrupar en tres cubos).
+#   • `compute_score` para el tamaño — el MISMO valor que calcula
+#     `slots.get_compute_score`, guardado en el documento al registrar.
+#
+# El score va en el documento, y no se ordena por `config.hidden_dim`, porque
+# para un Transformer el término de atención (ws²·0.5) domina: un
+# `hd=32, ws=500` puntúa 126.024 (LARGE) mientras que un LSTM `hd=128, nl=2`
+# puntúa 32.768 (MEDIUM). Por hidden_dim el LARGE adelantaría al MEDIUM.
+#
+# Con `speed_asc`, el orden resultante es exactamente:
+#   rápido+SMALL → rápido+MEDIUM → rápido+LARGE → lento+SMALL → ...
 _SORT_BY_PICK_ORDER = {
-    "speed_asc":  "config.epochs:asc,config.hidden_dim:asc,config.num_layers:asc",
-    "speed_desc": "config.epochs:desc,config.hidden_dim:asc,config.num_layers:asc",
-    "size_asc":   "config.hidden_dim:asc,config.num_layers:asc,config.epochs:asc",
-    "size_desc":  "config.hidden_dim:desc,config.num_layers:desc,config.epochs:asc",
-    "slots":      "config.hidden_dim:asc,config.num_layers:asc",
+    "speed_asc":  "config.epochs:asc,compute_score:asc",
+    "speed_desc": "config.epochs:desc,compute_score:asc",
+    "size_asc":   "compute_score:asc,config.epochs:asc",
+    "size_desc":  "compute_score:desc,config.epochs:asc",
+    "slots":      "compute_score:asc",
 }
 
 
@@ -468,6 +490,13 @@ def main():
                     help="Print backend summary (counts + duration + ETA) and exit.")
     ap.add_argument("--no-register", action="store_true",
                     help="Skip the bulk register step.")
+    ap.add_argument("--backfill-scores", action="store_true",
+                    help="Calcula compute_score/size_tier en los experimentos "
+                         "ya registrados y sale. Necesario una vez tras "
+                         "actualizar; idempotente.")
+    ap.add_argument("--backfill-all", action="store_true",
+                    help="Con --backfill-scores: recalcula TODOS en vez de "
+                         "solo los que no lo tienen.")
     ap.add_argument("--consume-only", action="store_true",
                     help="Same as --no-register; clearer name for worker-only agents.")
 
@@ -528,6 +557,21 @@ def main():
           f"devices={devices} consume_any={consume_any}", flush=True)
     print(f"[agent] slots/device: {slots_for}", flush=True)
     print(f"[agent] pick_order: {pick_order} -> sort={sort_spec_for(pick_order)}", flush=True)
+
+    if args.backfill_scores:
+        scope = "TODOS" if args.backfill_all else "solo los que faltan"
+        print(f"[agent] backfill de compute_score/size_tier ({scope})...", flush=True)
+        t0 = time.time()
+        res = client.backfill_scores(recompute_all=args.backfill_all)
+        print(f"[agent] matched={res.get('matched')} "
+              f"modified={res.get('modified')} "
+              f"sin_score={res.get('still_missing')} "
+              f"({time.time() - t0:.1f}s)", flush=True)
+        if res.get("still_missing"):
+            print("[agent] AVISO: quedan documentos sin compute_score; se "
+                  "colarían al principio de la cola (un campo ausente ordena "
+                  "primero en ascendente).", flush=True)
+        return
 
     if args.status:
         print("[agent] backend stats:")

@@ -160,6 +160,12 @@ Body:
 - `sort` is a comma-separated list of `path[:asc|desc]`. Direction defaults
   to `asc`. Paths are restricted to `[A-Za-z0-9_.]` — anything else is a
   `400`, so an operator cannot be smuggled into the sort document.
+- The default agent sort is `config.epochs:asc,compute_score:asc`, which
+  yields **fast+SMALL → fast+MEDIUM → fast+LARGE → slow+SMALL → …**.
+  The size key is `compute_score`, not `config.hidden_dim`: for a Transformer
+  the attention term dominates, so `hd=32, ws=500` scores 126,024 (LARGE)
+  while an LSTM `hd=128, nl=2` scores 32,768 (MEDIUM) — ordering by
+  `hidden_dim` would put the LARGE one first.
 - `prefer_device` restricts the claim to experiments whose registered
   `config.device` matches. The agent calls with it first and retries without
   it on `404`, which reproduces "prefer this GPU, but take anything".
@@ -173,6 +179,24 @@ Responses:
 **Indexes.** The sorted claim needs `{status:1, "config.epochs":1, ...}`,
 otherwise Mongo does a blocking in-memory sort (capped at 32 MB) over the
 whole pending queue. The server creates the indexes it needs at startup.
+
+## `POST .../backfill-scores`
+
+Computes `compute_score` / `size_tier` for documents registered before those
+fields existed. One server-side pipeline update — no per-document round
+trips — and idempotent.
+
+| Param | Default | Notes |
+|---|---|---|
+| `all` | `false` | `true` recomputes every document instead of only the ones missing a score |
+
+- `200` → `{ "dataset": "...", "matched": N, "modified": M, "still_missing": 0 }`
+
+**Run this once after upgrading.** A missing field sorts *first* in an
+ascending Mongo sort, so any document without a `compute_score` jumps to the
+head of the queue regardless of how big or slow it is.
+
+From the agent: `python agent.py --config <cfg> --backfill-scores`
 
 ## `POST .../experiments/bulk`
 

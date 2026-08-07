@@ -52,17 +52,43 @@ def test_speed_asc_orders_epochs_ascending_first():
     assert first == "config.epochs:asc", f"clave primaria = {first}"
 
 
+def test_speed_asc_then_size_ascending():
+    """La prioridad pedida: rápido+SMALL → rápido+MEDIUM → rápido+LARGE."""
+    parts = agent_mod.sort_spec_for("speed_asc").split(",")
+    assert parts == ["config.epochs:asc", "compute_score:asc"]
+
+
 def test_speed_desc_inverts_only_epochs():
     """speed_desc invierte epochs pero sigue prefiriendo el modelo pequeño."""
-    spec = agent_mod.sort_spec_for("speed_desc")
-    parts = spec.split(",")
+    parts = agent_mod.sort_spec_for("speed_desc").split(",")
     assert parts[0] == "config.epochs:desc"
-    assert "config.hidden_dim:asc" in parts
+    assert "compute_score:asc" in parts
 
 
-def test_size_orders_by_hidden_dim_first():
-    assert agent_mod.sort_spec_for("size_asc").split(",")[0] == "config.hidden_dim:asc"
-    assert agent_mod.sort_spec_for("size_desc").split(",")[0] == "config.hidden_dim:desc"
+def test_size_orders_by_compute_score_first():
+    assert agent_mod.sort_spec_for("size_asc").split(",")[0] == "compute_score:asc"
+    assert agent_mod.sort_spec_for("size_desc").split(",")[0] == "compute_score:desc"
+
+
+def test_size_key_is_compute_score_not_hidden_dim():
+    """hidden_dim es una aproximación que falla con Transformer: el término de
+    atención (ws²·0.5) domina, así que un hd=32/ws=500 es LARGE."""
+    from slots import get_compute_score, get_tier
+    tr = {"architecture": "Transformer", "hidden_dim": 32,
+          "num_layers": 1, "window_size": 500}
+    lstm = {"architecture": "LSTM", "hidden_dim": 128,
+            "num_layers": 2, "window_size": 500}
+    assert get_tier(tr) == "LARGE"
+    assert get_tier(lstm) == "MEDIUM"
+    assert get_compute_score(tr) > get_compute_score(lstm), \
+        "el Transformer LARGE debe puntuar por encima del LSTM MEDIUM"
+    assert tr["hidden_dim"] < lstm["hidden_dim"], \
+        "…pero por hidden_dim iría antes: por eso se ordena por compute_score"
+
+    for po in agent_mod.PICK_ORDERS:
+        spec = agent_mod.sort_spec_for(po)
+        assert "config.hidden_dim" not in spec, f"{po} sigue usando hidden_dim"
+        assert "compute_score" in spec, f"{po} no usa compute_score"
 
 
 def test_sort_specs_only_use_safe_bson_paths():
@@ -73,6 +99,56 @@ def test_sort_specs_only_use_safe_bson_paths():
             key, _, direction = part.partition(":")
             assert set(key) <= allowed, f"clave insegura: {key}"
             assert direction in ("asc", "desc"), f"dirección inválida: {direction}"
+
+
+def test_register_grid_sends_score_and_tier(backend):
+    """El backend no reimplementa la fórmula: la recibe ya calculada."""
+    from slots import get_compute_score, get_tier
+    grid = [
+        {"architecture": "Transformer", "hidden_dim": 32, "num_layers": 1,
+         "window_size": 500, "epochs": 1, "dataset": "ds"},
+        {"architecture": "LSTM", "hidden_dim": 128, "num_layers": 2,
+         "window_size": 500, "epochs": 1, "dataset": "ds"},
+    ]
+
+    sent = {}
+
+    class FakeClient:
+        def bulk_create(self, batch):
+            for item in batch:
+                sent[item["exp_name"]] = item
+            return {"inserted": len(batch), "skipped": 0}
+
+    agent_mod.register_grid(FakeClient(), "ds", grid)
+    assert len(sent) == 2
+
+    by_arch = {v["architecture"]: v for v in sent.values()}
+    tr, lstm = by_arch["Transformer"], by_arch["LSTM"]
+
+    assert tr["compute_score"] == get_compute_score(grid[0])
+    assert tr["size_tier"] == get_tier(grid[0]) == "LARGE"
+    assert lstm["size_tier"] == "MEDIUM"
+    assert tr["compute_score"] > lstm["compute_score"], \
+        "el LARGE debe ir después del MEDIUM en orden ascendente"
+
+
+def test_register_grid_scores_every_architecture(backend):
+    """MLP usa hidden_dims (lista); no puede quedarse sin score."""
+    grid = [
+        {"architecture": "MLP", "hidden_dims": [128, 64, 32], "epochs": 1, "dataset": "ds"},
+        {"architecture": "CNN", "hidden_dim": 64, "num_layers": 1, "epochs": 1, "dataset": "ds"},
+    ]
+    sent = []
+
+    class FakeClient:
+        def bulk_create(self, batch):
+            sent.extend(batch)
+            return {"inserted": len(batch), "skipped": 0}
+
+    agent_mod.register_grid(FakeClient(), "ds", grid)
+    for item in sent:
+        assert item["compute_score"] > 0, f"sin score: {item['exp_name']}"
+        assert item["size_tier"] in ("SMALL", "MEDIUM", "LARGE")
 
 
 def test_sort_spec_matches_local_ordering_semantics():

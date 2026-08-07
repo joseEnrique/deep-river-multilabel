@@ -131,6 +131,8 @@ func (h *Handlers) CreateExperiment(w http.ResponseWriter, r *http.Request) {
 		Architecture: req.Architecture,
 		Config:       req.Config,
 		Status:       StatusPending,
+		ComputeScore: req.ComputeScore,
+		SizeTier:     req.SizeTier,
 	}
 	if err := h.Store.Create(r.Context(), dataset, exp); err != nil {
 		if mapErr(w, err) {
@@ -166,6 +168,8 @@ func (h *Handlers) BulkCreate(w http.ResponseWriter, r *http.Request) {
 			Architecture: e.Architecture,
 			Config:       e.Config,
 			Status:       StatusPending,
+			ComputeScore: e.ComputeScore,
+			SizeTier:     e.SizeTier,
 		})
 	}
 	inserted, skipped, err := h.Store.BulkCreate(r.Context(), dataset, exps)
@@ -311,6 +315,24 @@ func parseSort(s string) (bson.D, error) {
 		out = append(out, bson.E{Key: key, Value: dir})
 	}
 	return out, nil
+}
+
+func (h *Handlers) BackfillScores(w http.ResponseWriter, r *http.Request) {
+	dataset := chi.URLParam(r, "dataset")
+	// ?all=true recomputes every document; the default only fills the gaps.
+	onlyMissing := r.URL.Query().Get("all") != "true"
+
+	matched, modified, missing, err := h.Store.BackfillScores(r.Context(), dataset, onlyMissing)
+	if err != nil {
+		if mapErr(w, err) {
+			return
+		}
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, BackfillResponse{
+		Dataset: dataset, Matched: matched, Modified: modified, Missing: missing,
+	})
 }
 
 func (h *Handlers) ClaimNextExperiment(w http.ResponseWriter, r *http.Request) {

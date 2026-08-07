@@ -23,23 +23,42 @@ type Experiment struct {
 	Architecture string                 `bson:"architecture,omitempty"  json:"architecture,omitempty"`
 	Dataset      string                 `bson:"dataset"                 json:"dataset"`
 	Config       map[string]interface{} `bson:"config"                  json:"config"`
-	Status       Status                 `bson:"status"                  json:"status"`
-	AgentID      string                 `bson:"agent_id,omitempty"      json:"agent_id,omitempty"`
-	Device       string                 `bson:"device,omitempty"        json:"device,omitempty"`
-	StartedAt    *time.Time             `bson:"started_at,omitempty"    json:"started_at,omitempty"`
-	FinishedAt   *time.Time             `bson:"finished_at,omitempty"   json:"finished_at,omitempty"`
-	Checkpoints  []Checkpoint           `bson:"checkpoints,omitempty"   json:"checkpoints,omitempty"`
-	FinalMetrics map[string]float64     `bson:"final_metrics,omitempty" json:"final_metrics,omitempty"`
-	DurationS    float64                `bson:"duration_s,omitempty"    json:"duration_s,omitempty"`
-	Error        string                 `bson:"error,omitempty"         json:"error,omitempty"`
-	CreatedAt    time.Time              `bson:"created_at"              json:"created_at"`
-	UpdatedAt    time.Time              `bson:"updated_at"              json:"updated_at"`
+	// ComputeScore mirrors slots.get_compute_score in the agent: hd²·nl, plus
+	// ws²·0.5 for Transformer. Stored so claim-next can order by real model
+	// size server-side. Ordering by config.hidden_dim instead would be wrong
+	// for Transformers, where the window term dominates.
+	ComputeScore float64 `bson:"compute_score,omitempty" json:"compute_score,omitempty"`
+	// SizeTier is the SMALL/MEDIUM/LARGE bucket derived from ComputeScore.
+	// Not used for ordering (the raw score is finer) — kept for filtering
+	// and for reading the queue at a glance.
+	SizeTier     string             `bson:"size_tier,omitempty" json:"size_tier,omitempty"`
+	Status       Status             `bson:"status"                  json:"status"`
+	AgentID      string             `bson:"agent_id,omitempty"      json:"agent_id,omitempty"`
+	Device       string             `bson:"device,omitempty"        json:"device,omitempty"`
+	StartedAt    *time.Time         `bson:"started_at,omitempty"    json:"started_at,omitempty"`
+	FinishedAt   *time.Time         `bson:"finished_at,omitempty"   json:"finished_at,omitempty"`
+	Checkpoints  []Checkpoint       `bson:"checkpoints,omitempty"   json:"checkpoints,omitempty"`
+	FinalMetrics map[string]float64 `bson:"final_metrics,omitempty" json:"final_metrics,omitempty"`
+	DurationS    float64            `bson:"duration_s,omitempty"    json:"duration_s,omitempty"`
+	Error        string             `bson:"error,omitempty"         json:"error,omitempty"`
+	CreatedAt    time.Time          `bson:"created_at"              json:"created_at"`
+	UpdatedAt    time.Time          `bson:"updated_at"              json:"updated_at"`
 }
 
 type CreateExperimentRequest struct {
 	ExpName      string                 `json:"exp_name"`
 	Architecture string                 `json:"architecture,omitempty"`
 	Config       map[string]interface{} `json:"config"`
+	ComputeScore float64                `json:"compute_score,omitempty"`
+	SizeTier     string                 `json:"size_tier,omitempty"`
+}
+
+// BackfillResponse reports what a scores backfill touched.
+type BackfillResponse struct {
+	Dataset  string `json:"dataset"`
+	Matched  int64  `json:"matched"`
+	Modified int64  `json:"modified"`
+	Missing  int64  `json:"still_missing"`
 }
 
 type ClaimRequest struct {
