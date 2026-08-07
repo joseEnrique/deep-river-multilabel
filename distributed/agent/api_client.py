@@ -20,7 +20,11 @@ class BackendError(Exception):
 class BackendClient:
     def __init__(self, base_url: str, dataset: str, agent_id: str,
                  api_key: str | None = None,
-                 timeout: float = 30.0, retries: int = 3, backoff: float = 1.5):
+                 timeout: float = 90.0, retries: int = 5, backoff: float = 2.0):
+        # 90 s > los 60 s del timeout HTTP del backend, para que un pico de
+        # carga (backfill, construcción de índices, muchos agentes a la vez)
+        # se traduzca en una respuesta lenta y no en un ReadTimeout del
+        # cliente. 5 reintentos con base 2 dan ~31 s de espera acumulada.
         self.base_url = base_url.rstrip("/")
         self.dataset = dataset
         self.agent_id = agent_id

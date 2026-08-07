@@ -42,7 +42,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
 from naming import make_exp_name
-from api_client import BackendClient
+from api_client import BackendClient, BackendError
 
 
 def load_yaml(path: str) -> dict:
@@ -167,6 +167,10 @@ def sort_spec_for(pick_order: str) -> str:
 # cada `poll_interval`, que es lo que evita machacar al backend sin motivo.
 MAX_IDLE_BACKOFF_S = 120.0
 
+# Tope del retroceso cuando el backend falla (timeout, 5xx, red caída). Más
+# corto que el de inactividad: aquí sí hay trabajo, solo no se puede pedir.
+MAX_ERROR_BACKOFF_S = 60.0
+
 
 def claim_with_backoff(client: BackendClient, device: str, sort_spec: str,
                        poll_interval: float):
@@ -181,6 +185,115 @@ def claim_with_backoff(client: BackendClient, device: str, sort_spec: str,
     if exp is None:
         exp = client.claim_next(device=device, sort=sort_spec)
     return exp
+
+
+class ResultNotReported(Exception):
+    """El experimento terminó bien pero no se pudo entregar el resultado.
+
+    Distinta de un fallo de entrenamiento: el resultado existe y está a salvo
+    en disco, solo falta que el backend lo acepte. Nunca debe traducirse en un
+    `fail()`, que registraría como fallido algo que sí funcionó."""
+
+
+def unreported_path(dataset: str) -> Path:
+    """Fichero de rescate: resultados calculados que aún no aceptó el backend."""
+    return HERE / f"unreported_{dataset}.jsonl"
+
+
+def save_unreported(dataset: str, payload: dict) -> None:
+    """Vuelca un resultado a disco en modo append.
+
+    Es la última red de seguridad: si matan el proceso mientras reintenta, el
+    resultado sigue ahí y se reenvía luego con --replay-unreported. Solo se
+    escribe cuando falla la entrega, así que en marcha normal no existe."""
+    try:
+        with open(unreported_path(dataset), "a") as f:
+            f.write(json.dumps(payload) + "\n")
+    except Exception as e:  # noqa: BLE001 — el disco tampoco puede tumbarnos
+        print(f"[agent] no se pudo guardar el resultado en disco: {e}", flush=True)
+
+
+def report_finish(client: BackendClient, name: str, final_m: dict,
+                  duration: float, checkpoints: list[dict], device: str,
+                  max_backoff: float = MAX_ERROR_BACKOFF_S) -> None:
+    """Entrega el resultado al backend. Reintenta indefinidamente.
+
+    No hay número de reintentos que valga: el resultado ya costó lo que costó,
+    así que se insiste con retroceso acotado hasta que el backend lo acepte.
+    Un 409 significa que ya estaba `done` (por ejemplo un proceso duplicado
+    tras un release) y se da por bueno: el resultado está en el backend.
+    """
+    payload = {"exp_name": name, "final_metrics": final_m,
+               "duration_s": duration, "checkpoints": checkpoints}
+    backoff = 1.0
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            client.finish(name, final_m, duration, checkpoints=checkpoints)
+            if attempt > 1:
+                print(f"[{device}]   resultado entregado tras {attempt} intentos",
+                      flush=True)
+            return
+        except BackendError as e:
+            if e.status == 409:
+                print(f"[{device}]   ya estaba done en el backend; nada que hacer",
+                      flush=True)
+                return
+            last = e
+        except KeyboardInterrupt:
+            save_unreported(client.dataset, payload)
+            print(f"[{device}]   interrumpido: resultado guardado en "
+                  f"{unreported_path(client.dataset).name}", flush=True)
+            raise ResultNotReported(name)
+        except Exception as e:  # noqa: BLE001 — red caída, DNS, lo que sea
+            last = e
+
+        # Primer fallo: asegurar el resultado en disco antes de seguir
+        # insistiendo, por si matan el proceso a mitad.
+        if attempt == 1:
+            save_unreported(client.dataset, payload)
+            print(f"[{device}]   backend no acepta el resultado ({last}); "
+                  f"guardado en {unreported_path(client.dataset).name}, "
+                  f"reintentando", flush=True)
+
+        time.sleep(backoff)
+        backoff = min(backoff * 2, max_backoff)
+
+
+def replay_unreported(client: BackendClient, dataset: str) -> tuple[int, int]:
+    """Reenvía los resultados que quedaron en disco. Devuelve (enviados, pendientes)."""
+    path = unreported_path(dataset)
+    if not path.exists():
+        return 0, 0
+    rows = []
+    for line in path.read_text().splitlines():
+        line = line.strip()
+        if line:
+            try:
+                rows.append(json.loads(line))
+            except json.JSONDecodeError:
+                pass
+
+    sent, leftover = 0, []
+    for r in rows:
+        try:
+            client.finish(r["exp_name"], r["final_metrics"], r["duration_s"],
+                          checkpoints=r.get("checkpoints") or None)
+            sent += 1
+        except BackendError as e:
+            if e.status == 409:
+                sent += 1  # ya estaba done: nada que reenviar
+            else:
+                leftover.append(r)
+        except Exception:  # noqa: BLE001
+            leftover.append(r)
+
+    if leftover:
+        path.write_text("\n".join(json.dumps(r) for r in leftover) + "\n")
+    else:
+        path.unlink(missing_ok=True)
+    return sent, len(leftover)
 
 
 def _run_one_task(name: str, cfg: dict, device: str, dataset: str,
@@ -207,7 +320,10 @@ def _run_one_task(name: str, cfg: dict, device: str, dataset: str,
             checkpoints_buf.append({"step": step, "elapsed_s": elapsed, "metrics": m})
 
         def on_finish(final_m: dict[str, float], duration: float):
-            client.finish(name, final_m, duration, checkpoints=checkpoints_buf)
+            # El resultado ya está calculado: cueste lo que cueste hay que
+            # entregarlo. Reintento indefinido — perder esto es perder horas
+            # de GPU, así que se insiste hasta que el backend responda.
+            report_finish(client, name, final_m, duration, checkpoints_buf, device)
             print(f"[{device}]   saved {len(checkpoints_buf)} checkpoints", flush=True)
 
         run_with_backend(
@@ -225,6 +341,11 @@ def _run_one_task(name: str, cfg: dict, device: str, dataset: str,
             client.fail(name, "KeyboardInterrupt")
         except Exception:
             pass
+        raise
+    except ResultNotReported:
+        # El experimento terminó BIEN; lo que falló fue entregarlo, y ya está
+        # guardado en disco para reenviarlo. Marcarlo `failed` aquí sería
+        # mentir sobre el resultado, así que se deja en `running`.
         raise
     except Exception as e:
         tb = traceback.format_exc()
@@ -282,6 +403,9 @@ def worker_main(device: str, agent_id: str, dataset: str, base_url: str,
     # que coger. Sin esto, N workers ociosos golpearían Mongo cada
     # `poll_interval` segundos indefinidamente al terminar el grid.
     idle_backoff = poll_interval
+    # Retroceso separado para fallos del backend, para no confundir "no hay
+    # trabajo" con "el backend no contesta".
+    error_backoff = 0.0
 
     with concurrent.futures.ProcessPoolExecutor(max_workers=max_slots) as executor:
         while True:
@@ -292,7 +416,22 @@ def worker_main(device: str, agent_id: str, dataset: str, base_url: str,
             # El backend elige Y reclama en una sola operación atómica. Primero
             # con afinidad de device (preferencia blanda: los configs registrados
             # para esta GPU), y si no hay ninguno, cualquiera.
-            exp = claim_with_backoff(client, device, sort_spec, poll_interval)
+            #
+            # Un fallo transitorio del backend (timeout, 5xx tras agotar los
+            # reintentos del cliente, corte de red) NO puede matar al worker:
+            # eso dejaría la GPU parada hasta un reinicio manual. Se retrocede
+            # y se sigue intentando.
+            try:
+                exp = claim_with_backoff(client, device, sort_spec, poll_interval)
+            except Exception as e:  # noqa: BLE001 — cualquier fallo de red/backend
+                error_backoff = min(max(error_backoff * 2, poll_interval),
+                                    MAX_ERROR_BACKOFF_S)
+                print(f"[{device}] backend no disponible ({type(e).__name__}: "
+                      f"{e}); reintento en {error_backoff:.0f}s", flush=True)
+                time.sleep(error_backoff)
+                continue
+
+            error_backoff = 0.0  # el backend responde: reinicia el retroceso
 
             if exp is None:
                 # Nada pendiente. Si todos los slots están libres, salimos;
@@ -318,8 +457,15 @@ def worker_main(device: str, agent_id: str, dataset: str, base_url: str,
 
             if not fits:
                 # Ya está reclamado, así que hay que devolverlo: si no, se
-                # quedaría en `running` sin que nadie lo ejecute.
-                client.release(name)
+                # quedaría en `running` sin que nadie lo ejecute. Si el
+                # release falla se queda huérfano, pero tumbar el worker por
+                # eso sería peor: se avisa y se sigue.
+                try:
+                    client.release(name)
+                except Exception as e:  # noqa: BLE001
+                    print(f"[{device}] no se pudo devolver {name} a pending "
+                          f"({e}); quedará en running hasta liberarlo a mano",
+                          flush=True)
                 time.sleep(poll_interval)
                 continue
 
@@ -490,6 +636,9 @@ def main():
                     help="Print backend summary (counts + duration + ETA) and exit.")
     ap.add_argument("--no-register", action="store_true",
                     help="Skip the bulk register step.")
+    ap.add_argument("--replay-unreported", action="store_true",
+                    help="Reenvía los resultados que quedaron sin entregar "
+                         "(unreported_<dataset>.jsonl) y sale.")
     ap.add_argument("--backfill-scores", action="store_true",
                     help="Calcula compute_score/size_tier en los experimentos "
                          "ya registrados y sale. Necesario una vez tras "
@@ -557,6 +706,18 @@ def main():
           f"devices={devices} consume_any={consume_any}", flush=True)
     print(f"[agent] slots/device: {slots_for}", flush=True)
     print(f"[agent] pick_order: {pick_order} -> sort={sort_spec_for(pick_order)}", flush=True)
+
+    if args.replay_unreported:
+        path = unreported_path(dataset)
+        if not path.exists():
+            print(f"[agent] no hay resultados pendientes ({path.name})", flush=True)
+            return
+        sent, left = replay_unreported(client, dataset)
+        print(f"[agent] reenviados={sent} pendientes={left}", flush=True)
+        if left:
+            print(f"[agent] quedan {left} en {path.name}; vuelve a intentarlo "
+                  f"cuando el backend esté disponible", flush=True)
+        return
 
     if args.backfill_scores:
         scope = "TODOS" if args.backfill_all else "solo los que faltan"

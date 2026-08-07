@@ -431,6 +431,249 @@ def test_claim_with_backoff_makes_at_most_two_requests(backend):
     assert len(backend.calls) - before == 2
 
 
+# ── Robustez: un fallo del backend no puede matar al worker ──────────────────
+
+def _calls_guarded_by_try(func, call_names: set[str]) -> dict[str, bool]:
+    """Para cada nombre de llamada, ¿aparece SIEMPRE dentro de un try/except
+    dentro de `func`? Se comprueba sobre el AST, no por texto."""
+    import ast, inspect, textwrap
+    tree = ast.parse(textwrap.dedent(inspect.getsource(func)))
+
+    found = {n: [] for n in call_names}
+
+    def call_name(node):
+        f = node.func
+        if isinstance(f, ast.Name):
+            return f.id
+        if isinstance(f, ast.Attribute):
+            return f.attr
+        return None
+
+    def walk(node, in_try: bool):
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, ast.Try):
+                for sub in child.body:
+                    walk(sub, True)
+                for h in child.handlers + child.orelse + child.finalbody:
+                    walk(h, in_try)
+                continue
+            if isinstance(child, ast.Call):
+                name = call_name(child)
+                if name in found:
+                    found[name].append(in_try)
+            walk(child, in_try)
+
+    walk(tree, False)
+    return {n: (bool(v) and all(v)) for n, v in found.items()}
+
+
+def test_worker_survives_backend_failure():
+    """Un ReadTimeout mató un worker entero en producción: `worker_main` no
+    capturaba nada alrededor de `claim_with_backoff`, así que la GPU quedaba
+    parada hasta reiniciar a mano. El bucle debe retroceder y seguir."""
+    guarded = _calls_guarded_by_try(
+        agent_mod.worker_main, {"claim_with_backoff", "release"})
+    assert guarded["claim_with_backoff"], \
+        "claim_with_backoff debe ir dentro de try/except: si no, un timeout " \
+        "mata el worker y la GPU queda parada"
+    import inspect
+    assert "MAX_ERROR_BACKOFF_S" in inspect.getsource(agent_mod.worker_main), \
+        "falta el retroceso ante errores"
+
+
+def test_error_backoff_is_bounded():
+    assert 0 < agent_mod.MAX_ERROR_BACKOFF_S <= 300
+    # Más corto que el de inactividad: aquí sí hay trabajo, solo no se puede pedir.
+    assert agent_mod.MAX_ERROR_BACKOFF_S <= agent_mod.MAX_IDLE_BACKOFF_S
+
+
+def test_release_failure_does_not_propagate():
+    """Si el release falla, se avisa pero no se tumba el worker."""
+    guarded = _calls_guarded_by_try(agent_mod.worker_main, {"release"})
+    assert guarded["release"], "client.release debe ir dentro de try/except"
+
+
+def test_client_timeout_exceeds_backend_http_timeout():
+    """El backend corta a los 60 s; si el cliente cortara antes, un pico de
+    carga se vería como ReadTimeout en vez de como respuesta lenta."""
+    import inspect
+    sig = inspect.signature(BackendClient.__init__)
+    assert sig.parameters["timeout"].default > 60.0, \
+        "el timeout del cliente debe superar los 60 s del backend"
+    assert sig.parameters["retries"].default >= 3
+
+
+# ── Entrega del resultado: no se puede perder nunca ──────────────────────────
+
+@pytest.fixture
+def tmp_unreported(tmp_path, monkeypatch):
+    """Redirige el fichero de rescate al tmp del test."""
+    monkeypatch.setattr(agent_mod, "unreported_path",
+                        lambda ds: tmp_path / f"unreported_{ds}.jsonl")
+    return tmp_path
+
+
+class FlakyFinishClient:
+    """Cliente que falla en `finish` N veces antes de aceptar."""
+
+    def __init__(self, fail_times, dataset="ds", exc=None, status=None):
+        self.left = fail_times
+        self.dataset = dataset
+        self.calls = 0
+        self.accepted = None
+        self._exc = exc
+        self._status = status
+
+    def finish(self, name, final_metrics, duration_s, checkpoints=None):
+        self.calls += 1
+        if self.left > 0:
+            self.left -= 1
+            if self._status is not None:
+                raise BackendError(self._status, "nope")
+            raise (self._exc or ConnectionError("red caida"))
+        self.accepted = (name, final_metrics, duration_s, checkpoints)
+        return {}
+
+
+def test_finish_retries_until_backend_accepts(tmp_unreported):
+    """El resultado ya costó lo que costó: se insiste hasta entregarlo."""
+    c = FlakyFinishClient(fail_times=4)
+    agent_mod.report_finish(c, "e1", {"macro_f1": 0.7}, 12.3, [], "cuda:0",
+                            max_backoff=0.01)
+    assert c.calls == 5
+    assert c.accepted[0] == "e1"
+    assert c.accepted[1]["macro_f1"] == 0.7
+
+
+def test_finish_saves_to_disk_on_first_failure(tmp_unreported):
+    """Antes de ponerse a reintentar, asegura el resultado en disco por si
+    matan el proceso a mitad."""
+    c = FlakyFinishClient(fail_times=2)
+    agent_mod.report_finish(c, "e1", {"macro_f1": 0.7}, 12.3,
+                            [{"step": 1000}], "cuda:0", max_backoff=0.01)
+    path = agent_mod.unreported_path("ds")
+    assert path.exists(), "no guardó el resultado antes de reintentar"
+    rows = [json.loads(l) for l in path.read_text().splitlines() if l.strip()]
+    assert rows[0]["exp_name"] == "e1"
+    assert rows[0]["final_metrics"]["macro_f1"] == 0.7
+    assert rows[0]["checkpoints"] == [{"step": 1000}]
+
+
+def test_finish_treats_409_as_done(tmp_unreported):
+    """409 = ya estaba done (proceso duplicado tras un release). El resultado
+    está en el backend, así que no hay que insistir."""
+    c = FlakyFinishClient(fail_times=99, status=409)
+    agent_mod.report_finish(c, "e1", {"macro_f1": 0.7}, 1.0, [], "cuda:0",
+                            max_backoff=0.01)
+    assert c.calls == 1, "un 409 no debe reintentarse"
+
+
+def test_finish_never_gives_up_on_5xx(tmp_unreported):
+    c = FlakyFinishClient(fail_times=6, status=503)
+    agent_mod.report_finish(c, "e1", {"macro_f1": 0.7}, 1.0, [], "cuda:0",
+                            max_backoff=0.01)
+    assert c.calls == 7
+
+
+def test_successful_experiment_is_never_marked_failed():
+    """El fallo que había: si `finish` reventaba, el `except` de fuera llamaba
+    a `fail()` y registraba como FALLIDO un experimento que había ido bien."""
+    src = __import__("inspect").getsource(agent_mod._run_one_task)
+    assert "ResultNotReported" in src, \
+        "debe distinguirse 'entrenamiento falló' de 'no pude entregarlo'"
+    # La rama de ResultNotReported tiene que relanzar, no llamar a fail().
+    idx = src.index("except ResultNotReported")
+    branch = src[idx:src.index("except Exception", idx)]
+    assert "client.fail" not in branch, \
+        "un fallo de entrega no puede marcar el experimento como failed"
+    assert "raise" in branch
+
+
+def test_replay_resends_and_clears(tmp_unreported):
+    ds = "ds"
+    path = agent_mod.unreported_path(ds)
+    path.write_text("\n".join(json.dumps({
+        "exp_name": f"e{i}", "final_metrics": {"macro_f1": i},
+        "duration_s": 1.0, "checkpoints": []}) for i in range(3)) + "\n")
+
+    class OK:
+        dataset = ds
+        sent = []
+
+        def finish(self, name, final_metrics, duration_s, checkpoints=None):
+            self.sent.append(name)
+            return {}
+
+    c = OK()
+    sent, left = agent_mod.replay_unreported(c, ds)
+    assert sent == 3 and left == 0
+    assert c.sent == ["e0", "e1", "e2"]
+    assert not path.exists(), "el fichero debe borrarse al vaciarse"
+
+
+def test_replay_keeps_what_still_fails(tmp_unreported):
+    ds = "ds"
+    path = agent_mod.unreported_path(ds)
+    path.write_text("\n".join(json.dumps({
+        "exp_name": f"e{i}", "final_metrics": {}, "duration_s": 1.0,
+        "checkpoints": []}) for i in range(3)) + "\n")
+
+    class HalfBroken:
+        dataset = ds
+
+        def finish(self, name, final_metrics, duration_s, checkpoints=None):
+            if name == "e1":
+                raise ConnectionError("sigue caido")
+            return {}
+
+    sent, left = agent_mod.replay_unreported(HalfBroken(), ds)
+    assert sent == 2 and left == 1
+    rows = [json.loads(l) for l in path.read_text().splitlines() if l.strip()]
+    assert [r["exp_name"] for r in rows] == ["e1"], \
+        "solo debe quedar el que sigue fallando"
+
+
+def test_replay_counts_409_as_delivered(tmp_unreported):
+    ds = "ds"
+    path = agent_mod.unreported_path(ds)
+    path.write_text(json.dumps({"exp_name": "e0", "final_metrics": {},
+                                "duration_s": 1.0, "checkpoints": []}) + "\n")
+
+    class AlreadyDone:
+        dataset = ds
+
+        def finish(self, *a, **k):
+            raise BackendError(409, "already done")
+
+    sent, left = agent_mod.replay_unreported(AlreadyDone(), ds)
+    assert sent == 1 and left == 0
+    assert not path.exists()
+
+
+def test_replay_survives_corrupt_lines(tmp_unreported):
+    ds = "ds"
+    path = agent_mod.unreported_path(ds)
+    path.write_text('{"exp_name":"ok","final_metrics":{},"duration_s":1,"checkpoints":[]}\n'
+                    'esto no es json\n'
+                    '\n')
+
+    class OK:
+        dataset = ds
+
+        def finish(self, *a, **k):
+            return {}
+
+    sent, left = agent_mod.replay_unreported(OK(), ds)
+    assert sent == 1 and left == 0
+
+
+def test_no_file_when_everything_works(tmp_unreported):
+    """En marcha normal el fichero de rescate no debe ni existir."""
+    c = FlakyFinishClient(fail_times=0)
+    agent_mod.report_finish(c, "e1", {"macro_f1": 0.7}, 1.0, [], "cuda:0")
+    assert not agent_mod.unreported_path("ds").exists()
+
+
 # ── release ──────────────────────────────────────────────────────────────────
 
 def test_release_returns_experiment_to_pending(backend):
