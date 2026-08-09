@@ -769,5 +769,52 @@ def test_run_one_task_signature_matches_submit_call():
                       "agent_id", "api_key", "checkpoint_every"]
 
 
+# ── OOM: la GPU llena no es un experimento roto ───────────────────────────────
+
+def test_is_oom_reconoce_las_dos_formas():
+    """Torch moderno lanza OutOfMemoryError; el antiguo, un RuntimeError."""
+    oom = type("OutOfMemoryError", (Exception,), {})
+    assert agent_mod._is_oom(oom("CUDA out of memory. Tried to allocate 1.44 GiB"))
+    assert agent_mod._is_oom(RuntimeError("CUDA out of memory. Tried to allocate 1 GiB"))
+    assert agent_mod._is_oom(RuntimeError("CUDA OUT OF MEMORY"))  # sin distinguir caja
+
+
+def test_is_oom_no_traga_otros_fallos():
+    """Un bug real debe seguir marcándose failed, no reciclarse para siempre."""
+    assert not agent_mod._is_oom(RuntimeError("shape '[2, 3]' is invalid"))
+    assert not agent_mod._is_oom(ValueError("bad config"))
+    assert not agent_mod._is_oom(KeyboardInterrupt())
+
+
+def test_oom_devuelve_a_pending_en_vez_de_marcar_failed():
+    """El bucle ✗/▶: `failed` es reclamable al instante, así que marcar un OOM
+    como failed hacía que el worker lo recogiera 88 ms después, para siempre."""
+    src = __import__("inspect").getsource(agent_mod._run_one_task)
+    idx = src.index("if _is_oom(e):")
+    branch = src[idx:src.index("tb = traceback.format_exc()", idx)]
+    assert "client.release" in branch, "un OOM debe volver a pending"
+    assert "client.fail" not in branch, "un OOM no es un experimento inválido"
+    assert "empty_cache" in branch, "hay que soltar la caché antes de rendirse"
+    assert "OOM_SENTINEL" in branch, "el padre necesita enterarse para retroceder"
+
+
+def test_worker_espera_antes_de_reclamar_tras_oom():
+    """Sin la espera, el hueco del que acaba de morir se rellena al instante
+    con otro que tampoco cabe."""
+    src = __import__("inspect").getsource(agent_mod.worker_main)
+    assert "oom_until" in src and "OOM_SENTINEL" in src
+    # La espera tiene que ir ANTES de reclamar, no después.
+    assert src.index("oom_until - time.time()") < src.index("claim_with_backoff"), \
+        "el retroceso por OOM debe aplicarse antes del claim"
+
+
+def test_backoff_de_oom_crece_y_tiene_tope():
+    assert agent_mod.OOM_BACKOFF_S < agent_mod.MAX_OOM_BACKOFF_S
+    b = agent_mod.OOM_BACKOFF_S
+    for _ in range(20):
+        b = min(b * 2, agent_mod.MAX_OOM_BACKOFF_S)
+    assert b == agent_mod.MAX_OOM_BACKOFF_S, "debe saturar, no crecer sin límite"
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

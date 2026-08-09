@@ -171,6 +171,30 @@ MAX_IDLE_BACKOFF_S = 120.0
 # corto que el de inactividad: aquí sí hay trabajo, solo no se puede pedir.
 MAX_ERROR_BACKOFF_S = 60.0
 
+# Retroceso tras un OOM de CUDA. Un OOM no dice que el experimento sea inválido,
+# sino que la GPU está llena AHORA: se devuelve a `pending` y se espera a que
+# las tareas en vuelo liberen memoria. Sin esta espera el worker vuelve a
+# reclamar en milisegundos y entra en un bucle ✗/▶ que quema un slot para
+# siempre.
+OOM_BACKOFF_S = 30.0
+MAX_OOM_BACKOFF_S = 300.0
+
+# Sentinela que `_run_one_task` devuelve al padre para distinguir un OOM de un
+# fallo normal. El proceso hijo no puede tocar el estado del worker.
+OOM_SENTINEL = "__oom__"
+
+
+def _is_oom(exc: BaseException) -> bool:
+    """True si la excepción es una falta de memoria de CUDA.
+
+    No se importa torch aquí (el padre nunca inicializa CUDA), así que se mira
+    el nombre de la clase además del mensaje: `torch.cuda.OutOfMemoryError` no
+    existe en versiones antiguas, donde el OOM llega como `RuntimeError`.
+    """
+    if type(exc).__name__ == "OutOfMemoryError":
+        return True
+    return "out of memory" in str(exc).lower()
+
 
 def claim_with_backoff(client: BackendClient, device: str, sort_spec: str,
                        poll_interval: float):
@@ -298,8 +322,12 @@ def replay_unreported(client: BackendClient, dataset: str) -> tuple[int, int]:
 
 def _run_one_task(name: str, cfg: dict, device: str, dataset: str,
                   base_url: str, agent_id: str, api_key: str | None,
-                  checkpoint_every: int) -> None:
-    """Subproceso: ejecuta un experimento ya claim-eado y reporta al backend."""
+                  checkpoint_every: int) -> str | None:
+    """Subproceso: ejecuta un experimento ya claim-eado y reporta al backend.
+
+    Devuelve `OOM_SENTINEL` si murió por falta de memoria de CUDA (para que el
+    worker padre retroceda antes de volver a reclamar), `None` en cualquier
+    otro caso."""
     # Import torch inside the child to keep CUDA init isolated per process.
     import torch  # noqa: F401
     from runner_adapter import run_with_backend
@@ -348,6 +376,23 @@ def _run_one_task(name: str, cfg: dict, device: str, dataset: str,
         # mentir sobre el resultado, así que se deja en `running`.
         raise
     except Exception as e:
+        if _is_oom(e):
+            # La GPU está llena, pero el experimento es perfectamente válido:
+            # marcarlo `failed` sería mentir sobre él y además lo dejaría
+            # reclamable al instante (el backend re-reparte los `failed`), que
+            # es justo el bucle que hay que evitar. Se devuelve a `pending` y
+            # se avisa al padre para que espere.
+            try:
+                torch.cuda.empty_cache()
+            except Exception:  # noqa: BLE001 — liberar caché es best-effort
+                pass
+            print(f"[{device}] ⚠  OOM en {name}: {e}", flush=True)
+            try:
+                client.release(name)
+            except Exception as re:  # noqa: BLE001
+                print(f"[{device}] (no se pudo devolver a pending: {re})", flush=True)
+            return OOM_SENTINEL
+
         tb = traceback.format_exc()
         msg = f"{e}\n{tb[:3000]}"
         print(f"[{device}] ✗  {name}: {e}", flush=True)
@@ -355,6 +400,7 @@ def _run_one_task(name: str, cfg: dict, device: str, dataset: str,
             client.fail(name, msg)
         except Exception as fe:
             print(f"[{device}] (failed to report failure: {fe})", flush=True)
+    return None
 
 
 def worker_main(device: str, agent_id: str, dataset: str, base_url: str,
@@ -391,11 +437,28 @@ def worker_main(device: str, agent_id: str, dataset: str, base_url: str,
     available_slots = max_slots
     cond = threading.Condition()
 
+    # Instante hasta el que no se reclama nada nuevo por haber sufrido un OOM,
+    # y retroceso actual (se dobla con cada OOM seguido, se reinicia al primer
+    # experimento que termina bien).
+    oom_until = 0.0
+    oom_backoff = OOM_BACKOFF_S
+
     def release_cb(slots_used: int):
-        def _cb(_fut):
-            nonlocal available_slots
+        def _cb(fut):
+            nonlocal available_slots, oom_until, oom_backoff
+            try:
+                outcome = fut.result()
+            except Exception:  # noqa: BLE001 — KeyboardInterrupt/ResultNotReported
+                outcome = None
             with cond:
                 available_slots += slots_used
+                if outcome == OOM_SENTINEL:
+                    oom_until = max(oom_until, time.time() + oom_backoff)
+                    print(f"[{device}] OOM: pauso {oom_backoff:.0f}s antes de "
+                          f"reclamar (slots libres: {available_slots})", flush=True)
+                    oom_backoff = min(oom_backoff * 2, MAX_OOM_BACKOFF_S)
+                else:
+                    oom_backoff = OOM_BACKOFF_S
                 cond.notify_all()
         return _cb
 
@@ -412,6 +475,16 @@ def worker_main(device: str, agent_id: str, dataset: str, base_url: str,
             with cond:
                 while available_slots == 0:
                     cond.wait()
+
+            # Tras un OOM se espera a que las tareas en vuelo liberen memoria
+            # antes de volver a pedir trabajo: si no, el hueco que deja el
+            # experimento que acaba de morir se rellena al instante con otro
+            # que tampoco cabe.
+            with cond:
+                wait_s = oom_until - time.time()
+            if wait_s > 0:
+                time.sleep(min(wait_s, MAX_OOM_BACKOFF_S))
+                continue
 
             # El backend elige Y reclama en una sola operación atómica. Primero
             # con afinidad de device (preferencia blanda: los configs registrados
