@@ -133,6 +133,7 @@ func (h *Handlers) CreateExperiment(w http.ResponseWriter, r *http.Request) {
 		Status:       StatusPending,
 		ComputeScore: req.ComputeScore,
 		SizeTier:     req.SizeTier,
+		ArchRank:     req.ArchRank,
 	}
 	if err := h.Store.Create(r.Context(), dataset, exp); err != nil {
 		if mapErr(w, err) {
@@ -170,6 +171,7 @@ func (h *Handlers) BulkCreate(w http.ResponseWriter, r *http.Request) {
 			Status:       StatusPending,
 			ComputeScore: e.ComputeScore,
 			SizeTier:     e.SizeTier,
+			ArchRank:     e.ArchRank,
 		})
 	}
 	inserted, skipped, err := h.Store.BulkCreate(r.Context(), dataset, exps)

@@ -90,7 +90,7 @@ def register_grid(client: BackendClient, dataset: str,
     Returns (inserted, skipped) as reported by the backend."""
     if not grid:
         return 0, 0
-    from slots import get_compute_score, get_tier
+    from slots import get_arch_rank, get_compute_score, get_tier
 
     items_backend: list[dict] = []
     for c in grid:
@@ -102,6 +102,7 @@ def register_grid(client: BackendClient, dataset: str,
             "config": c,
             "compute_score": get_compute_score(c),
             "size_tier": get_tier(c),
+            "arch_rank": get_arch_rank(c),
         })
 
     total_ins, total_skip = 0, 0
@@ -147,23 +148,26 @@ def _resolve_pick_order(value) -> str:
 # puntúa 32.768 (MEDIUM). Por hidden_dim el LARGE adelantaría al MEDIUM.
 #
 # Con `speed_asc`, el orden resultante es exactamente:
-#   rápido+SMALL → rápido+MEDIUM → rápido+LARGE → lento+SMALL → ...
-# y DENTRO de cada uno de esos pares, los Transformer los últimos, para que lo
-# que más RAM necesita quede para el final y no acapare la GPU mientras aún
-# queda trabajo barato.
 #
-# Los dos desempates aprovechan el alfabeto en vez de añadir campos nuevos al
-# documento (que obligaría a un backfill de toda la colección):
+#   1) TODO lo que no es Transformer, de lo más rápido y pequeño a lo más
+#      pesado:  rápido+SMALL → rápido+MEDIUM → rápido+LARGE → lento+SMALL → ...
+#   2) y al final, todos los Transformer, con ese mismo orden interno.
 #
-#   • `size_tier:desc`   → SMALL, MEDIUM, LARGE   (S > M > L)
-#   • `architecture:asc` → CNN, LSTM, MLP, Transformer
+# Los Transformer van al final del TODO, no al final de cada grupo: a igualdad
+# de tier necesitan bastante más VRAM, así que se quedan para cuando ya no hay
+# trabajo barato al que estorbar.
 #
-# Son propiedades reales de los valores actuales, no una coincidencia que dé
-# igual: `test_orden_alfabetico_de_tiers_y_arquitecturas` las verifica, y salta
-# si algún día se añade un tier o una arquitectura que las rompa.
+# La clave de arquitectura es `arch_rank` (0/1) y no `architecture`: ordenar por
+# el nombre agruparía CNN / LSTM / MLP por separado, cuando lo que se quiere es
+# mezclarlos y separar solo Transformer.
+#
+# `size_tier:desc` da SMALL → MEDIUM → LARGE aprovechando el alfabeto (S > M > L)
+# en vez de añadir otro campo. Lo verifica
+# `test_orden_alfabetico_de_tiers`, que salta si algún día se añade un tier que
+# rompa esa propiedad.
 _SORT_BY_PICK_ORDER = {
-    "speed_asc":  "config.epochs:asc,size_tier:desc,architecture:asc,compute_score:asc",
-    "speed_desc": "config.epochs:desc,size_tier:desc,architecture:asc,compute_score:asc",
+    "speed_asc":  "arch_rank:asc,config.epochs:asc,size_tier:desc,compute_score:asc",
+    "speed_desc": "arch_rank:asc,config.epochs:desc,size_tier:desc,compute_score:asc",
     "size_asc":   "compute_score:asc,config.epochs:asc",
     "size_desc":  "compute_score:desc,config.epochs:asc",
     "slots":      "compute_score:asc",

@@ -130,3 +130,20 @@ def get_speed_rank(cfg: dict) -> int:
 def get_slots_needed(cfg: dict) -> int:
     """Retorna 2 (SMALL), 2 (MEDIUM) o 4 (LARGE) según compute_score y arch."""
     return _TIER_TO_SLOTS[get_tier(cfg)]
+
+
+# ── Rango de arquitectura (para el orden de reparto) ──────────────────────────
+# Clave BINARIA, no el nombre de la arquitectura: se quiere «todo lo que no es
+# Transformer, mezclado» y luego los Transformer. Ordenar por `architecture`
+# agruparía CNN / LSTM / MLP por separado, que no es lo mismo.
+ARCH_RANK_NORMAL = 0
+ARCH_RANK_LAST = 1
+
+
+def get_arch_rank(cfg: dict) -> int:
+    """0 para todo, 1 para Transformer: los deja al final de la cola.
+
+    Un Transformer necesita bastante más VRAM que el resto a igualdad de tier,
+    así que se dejan para cuando ya no queda trabajo barato que adelantar."""
+    arch = str(cfg.get("architecture") or cfg.get("arch") or "")
+    return ARCH_RANK_LAST if arch == "Transformer" else ARCH_RANK_NORMAL

@@ -31,7 +31,14 @@ type Experiment struct {
 	// SizeTier is the SMALL/MEDIUM/LARGE bucket derived from ComputeScore.
 	// Not used for ordering (the raw score is finer) — kept for filtering
 	// and for reading the queue at a glance.
-	SizeTier     string             `bson:"size_tier,omitempty" json:"size_tier,omitempty"`
+	SizeTier string `bson:"size_tier,omitempty" json:"size_tier,omitempty"`
+	// ArchRank is 0 for every architecture and 1 for Transformer, so claim-next
+	// can push Transformers to the very end of the queue: at equal tier they
+	// need noticeably more VRAM. It is a binary key on purpose — sorting by
+	// `architecture` would group CNN / LSTM / MLP separately instead of mixing
+	// them. Not `omitempty`: 0 is the meaningful common case, and a missing
+	// field sorts FIRST ascending, which would do the exact opposite.
+	ArchRank     int                `bson:"arch_rank" json:"arch_rank"`
 	Status       Status             `bson:"status"                  json:"status"`
 	AgentID      string             `bson:"agent_id,omitempty"      json:"agent_id,omitempty"`
 	Device       string             `bson:"device,omitempty"        json:"device,omitempty"`
@@ -51,6 +58,7 @@ type CreateExperimentRequest struct {
 	Config       map[string]interface{} `json:"config"`
 	ComputeScore float64                `json:"compute_score,omitempty"`
 	SizeTier     string                 `json:"size_tier,omitempty"`
+	ArchRank     int                    `json:"arch_rank,omitempty"`
 }
 
 // BackfillResponse reports what a scores backfill touched.

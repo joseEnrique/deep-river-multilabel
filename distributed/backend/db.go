@@ -255,8 +255,17 @@ func computeScorePipeline() mongo.Pipeline {
 		}},
 	}}
 
+	// arch_rank mirrors slots.get_arch_rank: 1 for Transformer, 0 otherwise, so
+	// claim-next can push Transformers to the end of the whole queue.
+	archRank := bson.M{"$cond": bson.A{
+		bson.M{"$eq": bson.A{arch, "Transformer"}}, 1, 0,
+	}}
+
 	return mongo.Pipeline{
-		bson.D{{Key: "$set", Value: bson.M{"compute_score": score}}},
+		bson.D{{Key: "$set", Value: bson.M{
+			"compute_score": score,
+			"arch_rank":     archRank,
+		}}},
 		bson.D{{Key: "$set", Value: bson.M{"size_tier": bson.M{"$switch": bson.M{
 			"branches": bson.A{
 				bson.M{"case": bson.M{"$lte": bson.A{"$compute_score", smallCeiling}}, "then": "SMALL"},
@@ -280,13 +289,22 @@ func (s *Store) BackfillScores(ctx context.Context, dataset string, onlyMissing 
 	}
 	filter := bson.M{}
 	if onlyMissing {
-		filter["compute_score"] = bson.M{"$exists": false}
+		// Cualquiera de los dos campos derivados que falte basta para
+		// reprocesar el documento: `arch_rank` se añadió después que
+		// `compute_score`, así que hay documentos con uno y sin el otro.
+		filter["$or"] = bson.A{
+			bson.M{"compute_score": bson.M{"$exists": false}},
+			bson.M{"arch_rank": bson.M{"$exists": false}},
+		}
 	}
 	res, uerr := c.UpdateMany(ctx, filter, computeScorePipeline())
 	if uerr != nil {
 		return 0, 0, 0, uerr
 	}
-	missing, cerr2 := c.CountDocuments(ctx, bson.M{"compute_score": bson.M{"$exists": false}})
+	missing, cerr2 := c.CountDocuments(ctx, bson.M{"$or": bson.A{
+		bson.M{"compute_score": bson.M{"$exists": false}},
+		bson.M{"arch_rank": bson.M{"$exists": false}},
+	}})
 	if cerr2 != nil {
 		return res.MatchedCount, res.ModifiedCount, 0, nil
 	}
