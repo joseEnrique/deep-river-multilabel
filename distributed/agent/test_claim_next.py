@@ -46,46 +46,57 @@ def test_unknown_pick_order_falls_back_to_default():
 
 
 def test_speed_asc_orders_epochs_ascending_first():
-    """speed_asc = primero lo barato: epochs asc y como clave PRIMARIA."""
-    spec = agent_mod.sort_spec_for("speed_asc")
-    first = spec.split(",")[0]
-    assert first == "config.epochs:asc", f"clave primaria = {first}"
+    """speed_asc = primero lo barato. La clave primaria es `arch_rank` (deja
+    los Transformer para el final del todo) y, dentro de cada bloque, epochs."""
+    parts = agent_mod.sort_spec_for("speed_asc").split(",")
+    assert parts[0] == "arch_rank:asc", f"clave primaria = {parts[0]}"
+    assert parts[1] == "config.epochs:asc", f"segunda clave = {parts[1]}"
 
 
 def test_speed_asc_then_size_ascending():
-    """La prioridad pedida: rápido+SMALL → rápido+MEDIUM → rápido+LARGE, y
-    dentro de cada par los Transformer al final."""
+    """La prioridad pedida: todo lo que no es Transformer de lo más rápido y
+    pequeño a lo más pesado, y los Transformer al final del TODO."""
     parts = agent_mod.sort_spec_for("speed_asc").split(",")
-    assert parts == ["config.epochs:asc", "size_tier:desc",
-                     "architecture:asc", "compute_score:asc"]
+    assert parts == ["arch_rank:asc", "config.epochs:asc",
+                     "size_tier:desc", "compute_score:asc"]
 
 
-def test_transformer_va_el_ultimo_dentro_de_cada_par():
-    """El desempate por arquitectura tiene que ir DESPUÉS del tier: si fuese
-    antes, agruparía por arquitectura y rompería el orden SMALL→MEDIUM→LARGE."""
+def test_transformer_va_al_final_del_todo_no_de_cada_grupo():
+    """`arch_rank` tiene que ir ANTES que epochs y tier. Si fuese un desempate
+    posterior, un Transformer rápido adelantaría a un CNN lento, que es justo lo
+    contrario de 'Transformer siempre al final'."""
     for order in ("speed_asc", "speed_desc"):
         parts = agent_mod.sort_spec_for(order).split(",")
-        assert parts.index("size_tier:desc") < parts.index("architecture:asc")
-        assert parts.index("architecture:asc") < parts.index("compute_score:asc")
+        assert parts.index("arch_rank:asc") == 0
+        assert parts.index("arch_rank:asc") < parts.index("size_tier:desc")
 
 
-def test_orden_alfabetico_de_tiers_y_arquitecturas():
-    """El sort se apoya en el alfabeto en vez de en campos nuevos. Si alguien
-    añade un tier o una arquitectura que rompa el orden, esto salta aquí y no
-    en producción repartiendo trabajo del revés."""
+def test_arch_rank_es_binario_no_por_nombre():
+    """Se quiere CNN/LSTM/MLP MEZCLADOS y solo Transformer aparte. Ordenar por
+    `architecture` los separaría en cuatro bloques."""
+    from slots import get_arch_rank
+    normales = [get_arch_rank({"architecture": a}) for a in ("CNN", "LSTM", "MLP")]
+    assert normales == [0, 0, 0], "los no-Transformer deben empatar"
+    assert get_arch_rank({"architecture": "Transformer"}) == 1
+    for order in ("speed_asc", "speed_desc"):
+        assert "architecture:" not in agent_mod.sort_spec_for(order)
+
+
+def test_orden_alfabetico_de_tiers():
+    """`size_tier:desc` se apoya en el alfabeto en vez de en otro campo. Si
+    alguien añade un tier que rompa el orden, salta aquí y no en producción
+    repartiendo trabajo del revés."""
     tiers = ["SMALL", "MEDIUM", "LARGE"]
     assert sorted(tiers, reverse=True) == tiers, \
         "size_tier:desc debe dar SMALL → MEDIUM → LARGE"
 
-    arquitecturas = ["CNN", "LSTM", "MLP", "Transformer"]
-    assert sorted(arquitecturas)[-1] == "Transformer", \
-        "architecture:asc debe dejar Transformer el último"
-
 
 def test_speed_desc_inverts_only_epochs():
-    """speed_desc invierte epochs pero sigue prefiriendo el modelo pequeño."""
+    """speed_desc invierte epochs pero sigue prefiriendo el modelo pequeño y
+    sigue dejando los Transformer para el final."""
     parts = agent_mod.sort_spec_for("speed_desc").split(",")
-    assert parts[0] == "config.epochs:desc"
+    assert parts[0] == "arch_rank:asc"
+    assert parts[1] == "config.epochs:desc"
     assert "compute_score:asc" in parts
 
 
@@ -185,7 +196,9 @@ def test_sort_spec_matches_local_ordering_semantics():
     fast = {"epochs": 1, "hidden_dim": 32, "num_layers": 1}
     slow = {"epochs": 20, "hidden_dim": 32, "num_layers": 1}
     assert get_speed_rank(fast) < get_speed_rank(slow)
-    assert agent_mod.sort_spec_for("speed_asc").startswith("config.epochs:asc")
+    # A igualdad de arch_rank (ninguno es Transformer), manda epochs asc.
+    assert agent_mod.sort_spec_for("speed_asc").startswith(
+        "arch_rank:asc,config.epochs:asc")
 
 
 # ── Backend de mentira ───────────────────────────────────────────────────────

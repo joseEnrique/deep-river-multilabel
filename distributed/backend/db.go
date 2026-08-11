@@ -116,15 +116,23 @@ func (s *Store) EnsureIndexes(ctx context.Context, dataset string) error {
 		//
 		// speed_asc (the default): fastest first, then smallest first —
 		// speed+SMALL, then speed+MEDIUM, then speed+LARGE.
-		idx("claim_speed_asc", bson.D{
+		// Nombres *_v2: las claves cambiaron al añadir arch_rank/size_tier, y
+		// recrear un índice con el mismo nombre y distinta clave hace fallar a
+		// CreateMany. Los `claim_speed_asc` / `claim_speed_desc` antiguos siguen
+		// en Mongo sin usarse; se pueden borrar a mano con dropIndex.
+		idx("claim_speed_asc_v2", bson.D{
 			{Key: "status", Value: 1},
+			{Key: "arch_rank", Value: 1},
 			{Key: "config.epochs", Value: 1},
+			{Key: "size_tier", Value: -1},
 			{Key: "compute_score", Value: 1},
 		}),
 		// speed_desc: mixed directions, so not covered by the index above.
-		idx("claim_speed_desc", bson.D{
+		idx("claim_speed_desc_v2", bson.D{
 			{Key: "status", Value: 1},
+			{Key: "arch_rank", Value: 1},
 			{Key: "config.epochs", Value: -1},
+			{Key: "size_tier", Value: -1},
 			{Key: "compute_score", Value: 1},
 		}),
 		// size_asc, and `slots` as its single-key prefix.
@@ -141,16 +149,20 @@ func (s *Store) EnsureIndexes(ctx context.Context, dataset string) error {
 		}),
 		// Device-affinity variants: prefer_device adds an equality on
 		// config.device, which must sit before the sort keys.
-		idx("claim_device_speed_asc", bson.D{
+		idx("claim_device_speed_asc_v2", bson.D{
 			{Key: "status", Value: 1},
 			{Key: "config.device", Value: 1},
+			{Key: "arch_rank", Value: 1},
 			{Key: "config.epochs", Value: 1},
+			{Key: "size_tier", Value: -1},
 			{Key: "compute_score", Value: 1},
 		}),
-		idx("claim_device_speed_desc", bson.D{
+		idx("claim_device_speed_desc_v2", bson.D{
 			{Key: "status", Value: 1},
 			{Key: "config.device", Value: 1},
+			{Key: "arch_rank", Value: 1},
 			{Key: "config.epochs", Value: -1},
+			{Key: "size_tier", Value: -1},
 			{Key: "compute_score", Value: 1},
 		}),
 		idx("claim_device_size_asc", bson.D{
