@@ -179,9 +179,40 @@ MAX_ERROR_BACKOFF_S = 60.0
 OOM_BACKOFF_S = 30.0
 MAX_OOM_BACKOFF_S = 300.0
 
+# Watchdog de cuelgues.
+#
+# `checkpoint_every` cuenta PASOS, no tiempo, así que "lleva X sin checkpoint"
+# NO sirve para detectar un cuelgue: medido sobre los runs que sí terminaron,
+# el más largo (38.3h) tardó 6.1h en emitir el primer checkpoint y tuvo huecos
+# de hasta 6.95h entre ellos. Cualquier umbral que no matase a ese tampoco
+# pillaría un cuelgue en horas.
+#
+# Por eso el hijo emite un latido en tiempo real desde un hilo aparte,
+# independiente del progreso del entrenamiento: si el latido para, el proceso
+# está muerto o bloqueado, y eso vale igual para un run de 30 segundos que para
+# uno de 38 horas. El vigilante vive en el PADRE, que es otro proceso: aunque el
+# hijo se quede clavado con el GIL cogido, el padre sigue viéndolo.
+HEARTBEAT_S = 60.0
+STALL_TIMEOUT_S = 300.0   # 5 latidos perdidos
+WATCHDOG_POLL_S = 30.0
+
+# Matar el proceso colgado no basta: al devolverlo a `pending`, `claim-next` lo
+# vuelve a entregar el primero y se cuelga otra vez. Sin freno, el ciclo
+# colgar→matar→reclamar da vueltas en segundos en vez de en horas — más rápido,
+# igual de inútil. Se retrocede tras cada cuelgue y, a la tercera, este worker
+# deja de tocar ese experimento y pasa a otra cosa.
+STALL_BACKOFF_S = 60.0
+MAX_STALL_BACKOFF_S = 900.0
+MAX_STALLS_PER_EXP = 2
+
 # Sentinela que `_run_one_task` devuelve al padre para distinguir un OOM de un
 # fallo normal. El proceso hijo no puede tocar el estado del worker.
 OOM_SENTINEL = "__oom__"
+
+# Códigos que el hijo deja en el `mp.Value` compartido. Con `mp.Process` no hay
+# valor de retorno, así que el resultado viaja por memoria compartida.
+OUTCOME_OK = 0
+OUTCOME_OOM = 1
 
 
 def _is_oom(exc: BaseException) -> bool:
@@ -320,20 +351,38 @@ def replay_unreported(client: BackendClient, dataset: str) -> tuple[int, int]:
     return sent, len(leftover)
 
 
+def _heartbeat_thread(heartbeat, stop_evt) -> None:
+    """Marca «sigo vivo» cada `HEARTBEAT_S` hasta que se pare el experimento.
+
+    Deliberadamente no mira el progreso: solo dice que el proceso responde. El
+    padre distingue así «va lento» de «está colgado», que es justo lo que el
+    contador de checkpoints no permite."""
+    while not stop_evt.wait(HEARTBEAT_S):
+        heartbeat.value = time.time()
+
+
 def _run_one_task(name: str, cfg: dict, device: str, dataset: str,
                   base_url: str, agent_id: str, api_key: str | None,
-                  checkpoint_every: int) -> str | None:
+                  checkpoint_every: int,
+                  heartbeat=None, outcome=None) -> str | None:
     """Subproceso: ejecuta un experimento ya claim-eado y reporta al backend.
 
-    Devuelve `OOM_SENTINEL` si murió por falta de memoria de CUDA (para que el
-    worker padre retroceda antes de volver a reclamar), `None` en cualquier
-    otro caso."""
+    `heartbeat` (mp.Value 'd') y `outcome` (mp.Value 'i') son los dos canales
+    hacia el padre: el latido para el watchdog, y el resultado para que sepa si
+    murió por OOM. Devuelve además `OOM_SENTINEL` en ese caso, `None` si no."""
     # Import torch inside the child to keep CUDA init isolated per process.
     import torch  # noqa: F401
+    import threading
     from runner_adapter import run_with_backend
 
     client = BackendClient(base_url=base_url, dataset=dataset, agent_id=agent_id,
                            api_key=api_key)
+
+    stop_beat = threading.Event()
+    if heartbeat is not None:
+        heartbeat.value = time.time()
+        threading.Thread(target=_heartbeat_thread, args=(heartbeat, stop_beat),
+                         daemon=True, name="heartbeat").start()
 
     print(f"[{device}] ▶  {name}", flush=True)
     t0 = time.time()
@@ -391,6 +440,8 @@ def _run_one_task(name: str, cfg: dict, device: str, dataset: str,
                 client.release(name)
             except Exception as re:  # noqa: BLE001
                 print(f"[{device}] (no se pudo devolver a pending: {re})", flush=True)
+            if outcome is not None:
+                outcome.value = OUTCOME_OOM
             return OOM_SENTINEL
 
         tb = traceback.format_exc()
@@ -400,6 +451,8 @@ def _run_one_task(name: str, cfg: dict, device: str, dataset: str,
             client.fail(name, msg)
         except Exception as fe:
             print(f"[{device}] (failed to report failure: {fe})", flush=True)
+    finally:
+        stop_beat.set()
     return None
 
 
@@ -417,7 +470,6 @@ def worker_main(device: str, agent_id: str, dataset: str, base_url: str,
     atómica (`claim-next`), así que no hay cola cacheada ni carreras entre
     agentes por el mismo documento."""
     import threading
-    import concurrent.futures
     from slots import get_slots_needed
 
     client = BackendClient(base_url=base_url, dataset=dataset, agent_id=agent_id,
@@ -437,30 +489,92 @@ def worker_main(device: str, agent_id: str, dataset: str, base_url: str,
     available_slots = max_slots
     cond = threading.Condition()
 
-    # Instante hasta el que no se reclama nada nuevo por haber sufrido un OOM,
-    # y retroceso actual (se dobla con cada OOM seguido, se reinicia al primer
-    # experimento que termina bien).
-    oom_until = 0.0
+    # Instante hasta el que no se reclama nada nuevo, con retroceso propio por
+    # motivo. Las dos causas —OOM y cuelgue— comparten el mismo peligro: el
+    # hueco que deja el experimento que acaba de morir se rellena al instante
+    # con otro que va a morir igual. Ambos retrocesos se doblan al repetirse y
+    # se reinician con el primer experimento que termina bien.
+    pause_until = 0.0
     oom_backoff = OOM_BACKOFF_S
+    stall_backoff = STALL_BACKOFF_S
+    # Cuántas veces se ha colgado cada experimento EN ESTE worker.
+    stalls: dict[str, int] = {}
 
-    def release_cb(slots_used: int):
-        def _cb(fut):
-            nonlocal available_slots, oom_until, oom_backoff
-            try:
-                outcome = fut.result()
-            except Exception:  # noqa: BLE001 — KeyboardInterrupt/ResultNotReported
-                outcome = None
+    def supervise(name: str, cfg: dict, slots_used: int):
+        """Lanza el experimento en su propio proceso y lo vigila.
+
+        Un `ProcessPoolExecutor` no vale aquí: reutiliza procesos y no deja
+        matar una tarea concreta, que es justo lo que hace falta cuando una se
+        queda colgada."""
+        nonlocal available_slots, pause_until, oom_backoff, stall_backoff
+
+        heartbeat = mp.Value("d", time.time())
+        outcome = mp.Value("i", OUTCOME_OK)
+        proc = mp.Process(
+            target=_run_one_task,
+            args=(name, cfg, device, dataset, base_url, agent_id,
+                  api_key, checkpoint_every, heartbeat, outcome),
+            name=f"task-{device}",
+        )
+        proc.start()
+
+        stalled = False
+        while True:
+            proc.join(timeout=WATCHDOG_POLL_S)
+            if not proc.is_alive():
+                break
+            silent = time.time() - heartbeat.value
+            if silent > STALL_TIMEOUT_S:
+                stalled = True
+                print(f"[{device}] ⏱  colgado: {silent / 60:.1f} min sin latido, "
+                      f"matando {name}", flush=True)
+                proc.terminate()
+                proc.join(timeout=30)
+                if proc.is_alive():
+                    proc.kill()
+                    proc.join(timeout=10)
+                break
+
+        if stalled:
             with cond:
-                available_slots += slots_used
-                if outcome == OOM_SENTINEL:
-                    oom_until = max(oom_until, time.time() + oom_backoff)
-                    print(f"[{device}] OOM: pauso {oom_backoff:.0f}s antes de "
-                          f"reclamar (slots libres: {available_slots})", flush=True)
-                    oom_backoff = min(oom_backoff * 2, MAX_OOM_BACKOFF_S)
-                else:
-                    oom_backoff = OOM_BACKOFF_S
-                cond.notify_all()
-        return _cb
+                stalls[name] = stalls.get(name, 0) + 1
+                veces = stalls[name]
+            if veces < MAX_STALLS_PER_EXP:
+                # El hijo ya no puede devolverlo: lo hace el padre. Cliente
+                # propio porque `requests.Session` no es seguro entre hilos y
+                # aquí puede haber varios supervisores a la vez.
+                try:
+                    BackendClient(base_url=base_url, dataset=dataset,
+                                  agent_id=agent_id, api_key=api_key).release(name)
+                except Exception as e:  # noqa: BLE001
+                    print(f"[{device}] (no se pudo devolver {name} a pending: {e})",
+                          flush=True)
+            else:
+                # Se ha colgado repetidamente: NO se devuelve. `claim-next`
+                # reparte `pending` y `failed` sin poder excluir nada, así que
+                # cualquiera de esos dos estados nos lo devolvería el primero y
+                # el worker se moriría de hambre reclamando siempre lo mismo.
+                # Dejarlo en `running` es lo único que lo saca del reparto.
+                print(f"[{device}] ⛔ {name} se colgó {veces} veces: lo dejo en "
+                      f"running (fuera del reparto) para revisarlo a mano",
+                      flush=True)
+
+        with cond:
+            available_slots += slots_used
+            if stalled:
+                pause_until = max(pause_until, time.time() + stall_backoff)
+                print(f"[{device}] cuelgue nº{stalls[name]} de {name}: "
+                      f"pauso {stall_backoff:.0f}s", flush=True)
+                stall_backoff = min(stall_backoff * 2, MAX_STALL_BACKOFF_S)
+            elif outcome.value == OUTCOME_OOM:
+                pause_until = max(pause_until, time.time() + oom_backoff)
+                print(f"[{device}] OOM: pauso {oom_backoff:.0f}s antes de "
+                      f"reclamar (slots libres: {available_slots})", flush=True)
+                oom_backoff = min(oom_backoff * 2, MAX_OOM_BACKOFF_S)
+            else:
+                oom_backoff = OOM_BACKOFF_S
+                stall_backoff = STALL_BACKOFF_S
+            cond.notify_all()
 
     # Retroceso exponencial para no martillear al backend cuando no hay nada
     # que coger. Sin esto, N workers ociosos golpearían Mongo cada
@@ -470,20 +584,23 @@ def worker_main(device: str, agent_id: str, dataset: str, base_url: str,
     # trabajo" con "el backend no contesta".
     error_backoff = 0.0
 
-    with concurrent.futures.ProcessPoolExecutor(max_workers=max_slots) as executor:
+    # Un hilo supervisor por experimento en vuelo. Sustituye al
+    # ProcessPoolExecutor: reutilizar procesos impide matar una tarea concreta
+    # (y con CUDA arrastra el contexto de un experimento al siguiente).
+    supervisors: list[threading.Thread] = []
+    try:
         while True:
             with cond:
                 while available_slots == 0:
                     cond.wait()
 
-            # Tras un OOM se espera a que las tareas en vuelo liberen memoria
-            # antes de volver a pedir trabajo: si no, el hueco que deja el
-            # experimento que acaba de morir se rellena al instante con otro
-            # que tampoco cabe.
+            # Tras un OOM o un cuelgue se espera antes de volver a pedir
+            # trabajo: si no, el hueco que deja el experimento que acaba de
+            # morir se rellena al instante con otro que muere igual.
             with cond:
-                wait_s = oom_until - time.time()
+                wait_s = pause_until - time.time()
             if wait_s > 0:
-                time.sleep(min(wait_s, MAX_OOM_BACKOFF_S))
+                time.sleep(min(wait_s, MAX_STALL_BACKOFF_S))
                 continue
 
             # El backend elige Y reclama en una sola operación atómica. Primero
@@ -520,6 +637,15 @@ def worker_main(device: str, agent_id: str, dataset: str, base_url: str,
             idle_backoff = poll_interval  # hubo trabajo: vuelve al ritmo normal
 
             name = exp["exp_name"]
+
+            if stalls.get(name, 0) >= MAX_STALLS_PER_EXP:
+                # Red de seguridad: si otro agente lo devolvió a pending y nos
+                # ha vuelto a tocar, se deja claimed (running) y se sigue. No
+                # se libera, por lo mismo de arriba: volvería inmediatamente.
+                print(f"[{device}] ⛔ {name} está en cuarentena aquí; "
+                      f"lo dejo claimed y sigo", flush=True)
+                continue
+
             cfg = exp["config"]
             slots_needed = get_slots_needed(cfg)
 
@@ -542,12 +668,15 @@ def worker_main(device: str, agent_id: str, dataset: str, base_url: str,
                 time.sleep(poll_interval)
                 continue
 
-            fut = executor.submit(
-                _run_one_task,
-                name, cfg, device, dataset, base_url, agent_id,
-                api_key, checkpoint_every,
-            )
-            fut.add_done_callback(release_cb(slots_needed))
+            t = threading.Thread(target=supervise,
+                                 args=(name, cfg, slots_needed),
+                                 name=f"supervisor-{device}", daemon=True)
+            t.start()
+            supervisors.append(t)
+            supervisors[:] = [s for s in supervisors if s.is_alive()]
+    finally:
+        for s in supervisors:
+            s.join(timeout=WATCHDOG_POLL_S)
 
 
 # ── Cube queries (CLI helpers) ────────────────────────────────────────────────

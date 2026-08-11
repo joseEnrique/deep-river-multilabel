@@ -766,7 +766,14 @@ def test_run_one_task_signature_matches_submit_call():
     import inspect
     params = list(inspect.signature(agent_mod._run_one_task).parameters)
     assert params == ["name", "cfg", "device", "dataset", "base_url",
-                      "agent_id", "api_key", "checkpoint_every"]
+                      "agent_id", "api_key", "checkpoint_every",
+                      "heartbeat", "outcome"]
+    # El padre pasa los args posicionalmente a mp.Process: si se reordenan aquí
+    # sin tocar allí, el experimento arranca con la config en el sitio del device.
+    src = inspect.getsource(agent_mod.worker_main)
+    call = src[src.index("target=_run_one_task"):src.index("name=f\"task-")]
+    for p in params:
+        assert p in call or p in ("cfg", "name"), f"{p} no se pasa a mp.Process"
 
 
 # ── OOM: la GPU llena no es un experimento roto ───────────────────────────────
@@ -802,10 +809,10 @@ def test_worker_espera_antes_de_reclamar_tras_oom():
     """Sin la espera, el hueco del que acaba de morir se rellena al instante
     con otro que tampoco cabe."""
     src = __import__("inspect").getsource(agent_mod.worker_main)
-    assert "oom_until" in src and "OOM_SENTINEL" in src
+    assert "pause_until" in src and "OUTCOME_OOM" in src
     # La espera tiene que ir ANTES de reclamar, no después.
-    assert src.index("oom_until - time.time()") < src.index("claim_with_backoff"), \
-        "el retroceso por OOM debe aplicarse antes del claim"
+    assert src.index("pause_until - time.time()") < src.index("claim_with_backoff"), \
+        "el retroceso debe aplicarse antes del claim"
 
 
 def test_backoff_de_oom_crece_y_tiene_tope():
@@ -814,6 +821,60 @@ def test_backoff_de_oom_crece_y_tiene_tope():
     for _ in range(20):
         b = min(b * 2, agent_mod.MAX_OOM_BACKOFF_S)
     assert b == agent_mod.MAX_OOM_BACKOFF_S, "debe saturar, no crecer sin límite"
+
+
+# ── Watchdog: distinguir «va lento» de «está colgado» ─────────────────────────
+
+def test_heartbeat_late_aunque_no_haya_progreso(monkeypatch):
+    """El latido no mira el entrenamiento: por eso sirve para un run de 30s y
+    para uno de 38h por igual."""
+    import threading
+    monkeypatch.setattr(agent_mod, "HEARTBEAT_S", 0.01)
+    hb = type("V", (), {"value": 0.0})()
+    stop = threading.Event()
+    t = threading.Thread(target=agent_mod._heartbeat_thread, args=(hb, stop),
+                         daemon=True)
+    t.start()
+    time.sleep(0.15)
+    primero = hb.value
+    assert primero > 0, "el latido debe haberse emitido sin ningún checkpoint"
+    time.sleep(0.1)
+    assert hb.value > primero, "el latido debe repetirse"
+    stop.set()
+    t.join(timeout=1)
+    assert not t.is_alive(), "el hilo debe morir al terminar el experimento"
+
+
+def test_umbral_de_cuelgue_deja_margen_a_varios_latidos():
+    """Un umbral cerca de HEARTBEAT_S mataría runs sanos por un hipo de red."""
+    assert agent_mod.STALL_TIMEOUT_S >= 3 * agent_mod.HEARTBEAT_S
+    assert agent_mod.WATCHDOG_POLL_S <= agent_mod.STALL_TIMEOUT_S
+
+
+def test_watchdog_mata_el_proceso_y_lo_devuelve_a_pending():
+    src = __import__("inspect").getsource(agent_mod.worker_main)
+    sup = src[src.index("def supervise"):]
+    assert "proc.terminate()" in sup
+    assert "proc.kill()" in sup, "si terminate no basta, hay que rematarlo"
+    assert sup.index("proc.terminate()") < sup.index(".release(name)"), \
+        "primero se mata el proceso, luego se devuelve el experimento"
+
+
+def test_watchdog_mide_latido_y_no_checkpoints():
+    """El fallo de fondo: `checkpoint_every` cuenta pasos, así que el hueco
+    entre checkpoints de un run sano llegó a 6.95h. No vale como señal."""
+    src = __import__("inspect").getsource(agent_mod.worker_main)
+    sup = src[src.index("def supervise"):]
+    assert "heartbeat.value" in sup
+    assert "checkpoint" not in sup.lower().replace("checkpoint_every", ""), \
+        "el watchdog no puede depender del progreso del entrenamiento"
+
+
+def test_no_queda_process_pool():
+    """El pool reutiliza procesos y no deja matar una tarea concreta."""
+    src = __import__("inspect").getsource(agent_mod.worker_main)
+    assert "executor.submit" not in src and "concurrent.futures" not in src
+    assert "mp.Process" in src
 
 
 if __name__ == "__main__":
