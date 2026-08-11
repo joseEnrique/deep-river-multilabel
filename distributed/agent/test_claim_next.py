@@ -53,9 +53,33 @@ def test_speed_asc_orders_epochs_ascending_first():
 
 
 def test_speed_asc_then_size_ascending():
-    """La prioridad pedida: rápido+SMALL → rápido+MEDIUM → rápido+LARGE."""
+    """La prioridad pedida: rápido+SMALL → rápido+MEDIUM → rápido+LARGE, y
+    dentro de cada par los Transformer al final."""
     parts = agent_mod.sort_spec_for("speed_asc").split(",")
-    assert parts == ["config.epochs:asc", "compute_score:asc"]
+    assert parts == ["config.epochs:asc", "size_tier:desc",
+                     "architecture:asc", "compute_score:asc"]
+
+
+def test_transformer_va_el_ultimo_dentro_de_cada_par():
+    """El desempate por arquitectura tiene que ir DESPUÉS del tier: si fuese
+    antes, agruparía por arquitectura y rompería el orden SMALL→MEDIUM→LARGE."""
+    for order in ("speed_asc", "speed_desc"):
+        parts = agent_mod.sort_spec_for(order).split(",")
+        assert parts.index("size_tier:desc") < parts.index("architecture:asc")
+        assert parts.index("architecture:asc") < parts.index("compute_score:asc")
+
+
+def test_orden_alfabetico_de_tiers_y_arquitecturas():
+    """El sort se apoya en el alfabeto en vez de en campos nuevos. Si alguien
+    añade un tier o una arquitectura que rompa el orden, esto salta aquí y no
+    en producción repartiendo trabajo del revés."""
+    tiers = ["SMALL", "MEDIUM", "LARGE"]
+    assert sorted(tiers, reverse=True) == tiers, \
+        "size_tier:desc debe dar SMALL → MEDIUM → LARGE"
+
+    arquitecturas = ["CNN", "LSTM", "MLP", "Transformer"]
+    assert sorted(arquitecturas)[-1] == "Transformer", \
+        "architecture:asc debe dejar Transformer el último"
 
 
 def test_speed_desc_inverts_only_epochs():

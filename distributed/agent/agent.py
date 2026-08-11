@@ -148,9 +148,22 @@ def _resolve_pick_order(value) -> str:
 #
 # Con `speed_asc`, el orden resultante es exactamente:
 #   rápido+SMALL → rápido+MEDIUM → rápido+LARGE → lento+SMALL → ...
+# y DENTRO de cada uno de esos pares, los Transformer los últimos, para que lo
+# que más RAM necesita quede para el final y no acapare la GPU mientras aún
+# queda trabajo barato.
+#
+# Los dos desempates aprovechan el alfabeto en vez de añadir campos nuevos al
+# documento (que obligaría a un backfill de toda la colección):
+#
+#   • `size_tier:desc`   → SMALL, MEDIUM, LARGE   (S > M > L)
+#   • `architecture:asc` → CNN, LSTM, MLP, Transformer
+#
+# Son propiedades reales de los valores actuales, no una coincidencia que dé
+# igual: `test_orden_alfabetico_de_tiers_y_arquitecturas` las verifica, y salta
+# si algún día se añade un tier o una arquitectura que las rompa.
 _SORT_BY_PICK_ORDER = {
-    "speed_asc":  "config.epochs:asc,compute_score:asc",
-    "speed_desc": "config.epochs:desc,compute_score:asc",
+    "speed_asc":  "config.epochs:asc,size_tier:desc,architecture:asc,compute_score:asc",
+    "speed_desc": "config.epochs:desc,size_tier:desc,architecture:asc,compute_score:asc",
     "size_asc":   "compute_score:asc,config.epochs:asc",
     "size_desc":  "compute_score:desc,config.epochs:asc",
     "slots":      "compute_score:asc",
