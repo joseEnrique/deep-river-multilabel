@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -13,6 +14,23 @@ import (
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/go-chi/cors"
 )
+
+// exceptSuffix applies a middleware to every request except the ones whose
+// path ends in `suffix`. Used to keep the blanket request timeout off the
+// streaming CSV export without having to hang the middleware on each of the
+// two dozen routes that do want it.
+func exceptSuffix(suffix string, mw func(http.Handler) http.Handler) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		wrapped := mw(next)
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if strings.HasSuffix(r.URL.Path, suffix) {
+				next.ServeHTTP(w, r)
+				return
+			}
+			wrapped.ServeHTTP(w, r)
+		})
+	}
+}
 
 func main() {
 	cfg := LoadConfig()
@@ -53,7 +71,11 @@ func main() {
 	r.Use(middleware.RealIP)
 	r.Use(middleware.Logger)
 	r.Use(middleware.Recoverer)
-	r.Use(middleware.Timeout(60 * time.Second))
+	// 60s is right for every JSON endpoint and wrong for results.csv, which
+	// is a streaming export of the whole collection: the middleware cancels
+	// the request context, which would kill the cursor mid-file. The export
+	// carries its own (much longer) deadline instead.
+	r.Use(exceptSuffix("/results.csv", middleware.Timeout(60*time.Second)))
 	// Hard ceiling on in-flight requests. This is what guarantees Mongo is
 	// never asked to do more than `cfg.MaxInFlight` things at once, however
 	// many agents connect. Excess requests wait in the backlog; if that fills

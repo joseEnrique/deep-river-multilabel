@@ -181,3 +181,7 @@ distributed/agent/local_*.db
 distributed/agent/local_*.db-shm
 distributed/agent/local_*.db-wal
 config-*
+
+alpiablation*
+ai4iablation*
+ablation*

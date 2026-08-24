@@ -445,27 +445,48 @@ def test_idle_backoff_is_bounded_and_grows():
     assert sum(1 for d in delays if d > poll) >= 8
 
 
-def test_claim_with_backoff_makes_at_most_two_requests(backend):
-    """Una petición por lanzamiento en régimen normal; dos solo si la afinidad
-    de device se agotó. Es lo que acota la carga sobre Mongo."""
+def test_claim_with_backoff_makes_one_request(backend):
+    """Una sola petición por lanzamiento: sin afinidad ya no hay reintento."""
     backend.pending = [make_exp("e1", device="cuda:0")]
     c = client_for(backend)
     before = len(backend.calls)
     got = agent_mod.claim_with_backoff(c, "cuda:0", "config.epochs:asc", 5.0)
     assert got is not None
-    assert len(backend.calls) - before == 1, "debería bastar una petición"
+    assert len(backend.calls) - before == 1
 
-    # Sin nada para esta GPU: una con filtro (404) y otra sin él.
-    backend.pending = [make_exp("e2", device="cuda:1")]
-    before = len(backend.calls)
-    got = agent_mod.claim_with_backoff(c, "cuda:0", "config.epochs:asc", 5.0)
-    assert got is not None and got["exp_name"] == "e2"
-    assert len(backend.calls) - before == 2
-
-    # Cola vacía: dos peticiones y None, nunca un bucle.
+    # Cola vacía: una petición y None, nunca un bucle.
+    backend.pending = []
     before = len(backend.calls)
     assert agent_mod.claim_with_backoff(c, "cuda:0", "config.epochs:asc", 5.0) is None
-    assert len(backend.calls) - before == 2
+    assert len(backend.calls) - before == 1
+
+
+def test_lo_que_no_cabe_nunca_no_gira_cada_poll_interval():
+    """Una GPU con menos slots que LARGE_SLOTS no puede ejecutar un LARGE jamás.
+    Sin distinguir 'no cabe ahora' de 'no cabe nunca', el worker lo reclama y lo
+    devuelve cada `poll_interval` para siempre."""
+    from slots import LARGE_SLOTS
+    src = __import__("inspect").getsource(agent_mod.worker_main)
+    assert "slots_needed > max_slots" in src, \
+        "hay que distinguir el caso imposible del transitorio"
+    rama = src[src.index("if slots_needed > max_slots"):]
+    assert "idle_backoff" in rama[:600], \
+        "el caso imposible debe usar el retroceso largo, no poll_interval"
+    assert LARGE_SLOTS > 1
+
+
+def test_claim_no_particiona_la_cola_por_device(backend):
+    """El fallo que había: `prefer_device` filtra ANTES del sort, así que
+    partía la cola en una por GPU y el orden global (Transformer al final)
+    dejaba de aplicarse. El worker de cuda:0 debe poder coger trabajo
+    registrado para cuda:1 si es lo siguiente en la cola."""
+    backend.pending = [make_exp("otro-device", device="cuda:1")]
+    c = client_for(backend)
+    got = agent_mod.claim_with_backoff(c, "cuda:0", "config.epochs:asc", 5.0)
+    assert got is not None and got["exp_name"] == "otro-device"
+    assert not any("prefer_device" in (body or {})
+                   for _, _, body in backend.calls), \
+        "no puede mandarse prefer_device: filtra antes del sort"
 
 
 # ── Robustez: un fallo del backend no puede matar al worker ──────────────────

@@ -1,14 +1,17 @@
 package main
 
 import (
+	"context"
 	"encoding/csv"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"go.mongodb.org/mongo-driver/bson"
@@ -462,6 +465,31 @@ func flattenJSON(prefix string, v interface{}, out map[string]string) {
 	}
 }
 
+// Only a couple of exports may be in flight at once. Each one walks the
+// whole collection; letting an unbounded number of them pile up is how the
+// server ends up thrashing instead of answering the agents that are trying
+// to claim work.
+var csvExportSlots = make(chan struct{}, 2)
+
+const (
+	// csvWriteWindow is how long one flush may take before the connection is
+	// dropped. The server's global WriteTimeout is 60s counted from the end
+	// of the request read, which would cut a multi-minute export in half;
+	// this replaces it with a deadline that rolls forward on every flush, so
+	// a slow-but-alive client keeps going and a dead one is still dropped.
+	csvWriteWindow = 2 * time.Minute
+	// Rows written per flush. Bounds how much sits in the bufio writer and
+	// keeps bytes arriving steadily, which is what tells the client (and any
+	// proxy in between) that the export is alive.
+	csvFlushEvery = 200
+)
+
+var csvBaseCols = []string{
+	"exp_name", "status", "architecture", "dataset",
+	"agent_id", "device",
+	"started_at", "finished_at", "duration_s", "created_at", "error",
+}
+
 // ResultsCSV streams a CSV that matches the old `final_results.csv` layout:
 // one row per experiment, all config and final-metric fields flattened.
 //
@@ -473,7 +501,25 @@ func flattenJSON(prefix string, v interface{}, out map[string]string) {
 //	device         exact-match filter
 //	loss_type      filter on config.loss.type
 //	limit, offset  pagination over the result set
+//
+// It streams. The previous version decoded every matching document into a
+// slice, built a second full copy of it as `[]map[string]string`, and only
+// then wrote the first byte — so a 60k-row export sent nothing for as long
+// as it lived and died of memory before it sent anything at all. Here the
+// header is discovered in one key-only pass and the rows go out as the
+// cursor yields them, so memory is flat in the number of matches and the
+// client sees the header within seconds.
 func (h *Handlers) ResultsCSV(w http.ResponseWriter, r *http.Request) {
+	select {
+	case csvExportSlots <- struct{}{}:
+		defer func() { <-csvExportSlots }()
+	default:
+		w.Header().Set("Retry-After", "60")
+		writeErr(w, http.StatusTooManyRequests,
+			"another CSV export is already running; retry shortly")
+		return
+	}
+
 	dataset := chi.URLParam(r, "dataset")
 	q := r.URL.Query()
 
@@ -501,7 +547,13 @@ func (h *Handlers) ResultsCSV(w http.ResponseWriter, r *http.Request) {
 	limit, _ := strconv.ParseInt(q.Get("limit"), 10, 64)
 	offset, _ := strconv.ParseInt(q.Get("offset"), 10, 64)
 
-	exps, err := h.Store.ListFiltered(r.Context(), dataset, filter, limit, offset)
+	// The route is exempt from the 60s request timeout (see main.go), so the
+	// export carries its own deadline. A context deadline takes precedence
+	// over the client-level opTimeout, so this is what bounds the cursor.
+	ctx, cancel := context.WithTimeout(r.Context(), exportTimeout)
+	defer cancel()
+
+	header, err := h.csvHeader(ctx, dataset, filter, limit, offset)
 	if err != nil {
 		if mapErr(w, err) {
 			return
@@ -510,47 +562,110 @@ func (h *Handlers) ResultsCSV(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// First pass: discover all config + metric keys so the header is stable.
+	// `checkpoints` is never used by the export and is the largest field on a
+	// finished run — dropping it server-side is most of the I/O saved.
+	cur, err := h.Store.StreamFiltered(ctx, dataset, filter,
+		bson.M{"checkpoints": 0}, limit, offset)
+	if err != nil {
+		if mapErr(w, err) {
+			return
+		}
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	defer cur.Close(ctx)
+
+	filename := fmt.Sprintf("results_%s_%s.csv", dataset, status)
+	w.Header().Set("Content-Type", "text/csv; charset=utf-8")
+	w.Header().Set("Content-Disposition", `attachment; filename="`+filename+`"`)
+	// Tell any reverse proxy not to buffer the body; buffering would undo
+	// the streaming and reproduce the "nothing for minutes" symptom.
+	w.Header().Set("X-Accel-Buffering", "no")
+
+	rc := http.NewResponseController(w)
+	// httptest.ResponseRecorder does not support deadlines. Ignoring the
+	// error keeps the handler usable under test.
+	extend := func() { _ = rc.SetWriteDeadline(time.Now().Add(csvWriteWindow)) }
+	extend()
+
+	cw := csv.NewWriter(w)
+	if err := cw.Write(header); err != nil {
+		return
+	}
+	cw.Flush()
+	_ = rc.Flush()
+
+	rec := make([]string, len(header))
+	row := make(map[string]string, len(header))
+	n := 0
+	for cur.Next(ctx) {
+		var e Experiment
+		if err := cur.Decode(&e); err != nil {
+			log.Printf("results.csv %s: decode: %v", dataset, err)
+			// The header is already on the wire, so there is no status code
+			// left to set. Abort the connection rather than closing the
+			// chunked body cleanly, which the client would read as a
+			// complete file.
+			panic(http.ErrAbortHandler)
+		}
+		clear(row)
+		csvRow(&e, row)
+		for i, col := range header {
+			rec[i] = row[col]
+		}
+		if err := cw.Write(rec); err != nil {
+			return
+		}
+		n++
+		if n%csvFlushEvery == 0 {
+			cw.Flush()
+			if cw.Error() != nil {
+				return // client hung up
+			}
+			_ = rc.Flush()
+			extend()
+		}
+	}
+	if err := cur.Err(); err != nil {
+		log.Printf("results.csv %s: cursor: %v", dataset, err)
+		panic(http.ErrAbortHandler)
+	}
+	cw.Flush()
+	_ = rc.Flush()
+}
+
+// csvHeader walks the matches once keeping only key *names*, so the header can
+// be fixed before the first row is written without holding any documents.
+// Memory here is the number of distinct columns, not the number of rows.
+func (h *Handlers) csvHeader(ctx context.Context, dataset string, filter bson.M, limit, offset int64) ([]string, error) {
+	cur, err := h.Store.StreamFiltered(ctx, dataset, filter,
+		bson.M{"config": 1, "final_metrics": 1}, limit, offset)
+	if err != nil {
+		return nil, err
+	}
+	defer cur.Close(ctx)
+
 	configKeys := map[string]struct{}{}
 	metricKeys := map[string]struct{}{}
-	rows := make([]map[string]string, 0, len(exps))
-	for _, e := range exps {
-		row := map[string]string{
-			"exp_name":     e.ExpName,
-			"status":       string(e.Status),
-			"architecture": e.Architecture,
-			"dataset":      e.Dataset,
-			"agent_id":     e.AgentID,
-			"device":       e.Device,
-			"duration_s":   fmt.Sprintf("%g", e.DurationS),
-			"error":        e.Error,
+	flat := map[string]string{}
+	for cur.Next(ctx) {
+		var e Experiment
+		if err := cur.Decode(&e); err != nil {
+			return nil, err
 		}
-		if e.StartedAt != nil {
-			row["started_at"] = e.StartedAt.UTC().Format("2006-01-02T15:04:05Z")
-		}
-		if e.FinishedAt != nil {
-			row["finished_at"] = e.FinishedAt.UTC().Format("2006-01-02T15:04:05Z")
-		}
-		row["created_at"] = e.CreatedAt.UTC().Format("2006-01-02T15:04:05Z")
-
-		flatCfg := map[string]string{}
-		flattenJSON("", e.Config, flatCfg)
-		for k, v := range flatCfg {
+		clear(flat)
+		flattenJSON("", e.Config, flat)
+		for k := range flat {
 			configKeys[k] = struct{}{}
-			row["cfg."+k] = v
 		}
-		for k, v := range e.FinalMetrics {
+		for k := range e.FinalMetrics {
 			metricKeys[k] = struct{}{}
-			row["metric."+k] = fmt.Sprintf("%g", v)
 		}
-		rows = append(rows, row)
+	}
+	if err := cur.Err(); err != nil {
+		return nil, err
 	}
 
-	baseCols := []string{
-		"exp_name", "status", "architecture", "dataset",
-		"agent_id", "device",
-		"started_at", "finished_at", "duration_s", "created_at", "error",
-	}
 	cfgCols := make([]string, 0, len(configKeys))
 	for k := range configKeys {
 		cfgCols = append(cfgCols, "cfg."+k)
@@ -562,25 +677,39 @@ func (h *Handlers) ResultsCSV(w http.ResponseWriter, r *http.Request) {
 	}
 	sort.Strings(metricCols)
 
-	header := append(append(baseCols, cfgCols...), metricCols...)
+	header := make([]string, 0, len(csvBaseCols)+len(cfgCols)+len(metricCols))
+	header = append(header, csvBaseCols...)
+	header = append(header, cfgCols...)
+	header = append(header, metricCols...)
+	return header, nil
+}
 
-	filename := fmt.Sprintf("results_%s_%s.csv", dataset, status)
-	w.Header().Set("Content-Type", "text/csv; charset=utf-8")
-	w.Header().Set("Content-Disposition", `attachment; filename="`+filename+`"`)
-	cw := csv.NewWriter(w)
-	if err := cw.Write(header); err != nil {
-		return
+// csvRow fills `row` (already cleared) with one experiment's flattened fields.
+func csvRow(e *Experiment, row map[string]string) {
+	row["exp_name"] = e.ExpName
+	row["status"] = string(e.Status)
+	row["architecture"] = e.Architecture
+	row["dataset"] = e.Dataset
+	row["agent_id"] = e.AgentID
+	row["device"] = e.Device
+	row["duration_s"] = fmt.Sprintf("%g", e.DurationS)
+	row["error"] = e.Error
+	if e.StartedAt != nil {
+		row["started_at"] = e.StartedAt.UTC().Format("2006-01-02T15:04:05Z")
 	}
-	rec := make([]string, len(header))
-	for _, row := range rows {
-		for i, col := range header {
-			rec[i] = row[col]
-		}
-		if err := cw.Write(rec); err != nil {
-			return
-		}
+	if e.FinishedAt != nil {
+		row["finished_at"] = e.FinishedAt.UTC().Format("2006-01-02T15:04:05Z")
 	}
-	cw.Flush()
+	row["created_at"] = e.CreatedAt.UTC().Format("2006-01-02T15:04:05Z")
+
+	flatCfg := map[string]string{}
+	flattenJSON("", e.Config, flatCfg)
+	for k, v := range flatCfg {
+		row["cfg."+k] = v
+	}
+	for k, v := range e.FinalMetrics {
+		row["metric."+k] = fmt.Sprintf("%g", v)
+	}
 }
 
 func (h *Handlers) ReleaseExperiment(w http.ResponseWriter, r *http.Request) {

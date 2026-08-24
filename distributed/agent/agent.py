@@ -246,17 +246,20 @@ def _is_oom(exc: BaseException) -> bool:
 
 def claim_with_backoff(client: BackendClient, device: str, sort_spec: str,
                        poll_interval: float):
-    """Reclama el siguiente experimento: primero con afinidad de device, luego
-    sin ella.
+    """Reclama el siguiente experimento respetando el orden global de la cola.
 
-    Son dos peticiones como mucho, y solo cuando hay un slot libre — es decir,
-    como mucho una vez por lanzamiento. El reintento sin filtro solo ocurre si
-    la afinidad se agotó, así que en régimen normal es una sola petición.
+    SIN afinidad de device, a propósito. `prefer_device` añade una igualdad
+    sobre `config.device` que se aplica ANTES del sort, así que particiona la
+    cola y el orden global deja de valer: con los grids actuales, que fijan
+    Transformer a `cuda:1` y CNN/LSTM a `cuda:0`, el worker de cuda:1 solo veía
+    Transformers y los cogía aunque quedasen 6.800 no-Transformer esperando en
+    la otra cola. Es decir, la afinidad rompía justo el «Transformer siempre al
+    final» que expresa `arch_rank`.
+
+    El `device` del config queda como dato informativo del registro; qué GPU
+    ejecuta qué lo decide el orden de la cola y los slots libres.
     """
-    exp = client.claim_next(device=device, sort=sort_spec, prefer_device=device)
-    if exp is None:
-        exp = client.claim_next(device=device, sort=sort_spec)
-    return exp
+    return client.claim_next(device=device, sort=sort_spec)
 
 
 class ResultNotReported(Exception):
@@ -503,6 +506,12 @@ def worker_main(device: str, agent_id: str, dataset: str, base_url: str,
           f"max_slots={max_slots}, pick_order={pick_order}, sort={sort_spec})",
           flush=True)
 
+    from slots import LARGE_SLOTS
+    if max_slots < LARGE_SLOTS:
+        print(f"[{device}] AVISO: max_slots={max_slots} < {LARGE_SLOTS}, así que "
+              f"esta GPU NO puede ejecutar experimentos LARGE. Los irá "
+              f"devolviendo a pending para que los coja otra.", flush=True)
+
     available_slots = max_slots
     cond = threading.Condition()
 
@@ -682,7 +691,20 @@ def worker_main(device: str, agent_id: str, dataset: str, base_url: str,
                     print(f"[{device}] no se pudo devolver {name} a pending "
                           f"({e}); quedará en running hasta liberarlo a mano",
                           flush=True)
-                time.sleep(poll_interval)
+
+                if slots_needed > max_slots:
+                    # No es que no quepa AHORA: no cabrá nunca en esta GPU.
+                    # Esperar a que se liberen slots no arregla nada, así que se
+                    # retrocede como si no hubiera trabajo, en vez de girar cada
+                    # `poll_interval` indefinidamente. Otro worker con más slots
+                    # se lo llevará.
+                    print(f"[{device}] {name} necesita {slots_needed} slots y "
+                          f"esta GPU tiene {max_slots}: no cabrá nunca, "
+                          f"reintento en {idle_backoff:.0f}s", flush=True)
+                    time.sleep(idle_backoff)
+                    idle_backoff = min(idle_backoff * 2, MAX_IDLE_BACKOFF_S)
+                else:
+                    time.sleep(poll_interval)
                 continue
 
             t = threading.Thread(target=supervise,

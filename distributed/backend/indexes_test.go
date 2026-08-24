@@ -13,8 +13,8 @@ import (
 // _SORT_BY_PICK_ORDER in distributed/agent/agent.py — if that map changes and
 // this one does not, TestEveryPickOrderIsIndexBacked will fail on the new sort.
 var agentSortSpecs = map[string]string{
-	"speed_asc":  "config.epochs:asc,compute_score:asc",
-	"speed_desc": "config.epochs:desc,compute_score:asc",
+	"speed_asc":  "arch_rank:asc,config.epochs:asc,size_tier:desc,compute_score:asc",
+	"speed_desc": "arch_rank:asc,config.epochs:desc,size_tier:desc,compute_score:asc",
 	"size_asc":   "compute_score:asc,config.epochs:asc",
 	"size_desc":  "compute_score:desc,config.epochs:asc",
 	"slots":      "compute_score:asc",
@@ -175,15 +175,29 @@ func TestAnalysisQueriesAreIndexBacked(t *testing.T) {
 			bson.M{"status": StatusDone, "final_metrics.subset_acc": bson.M{"$exists": true}},
 			bson.D{{Key: "final_metrics.subset_acc", Value: -1}},
 		},
+		// The CSV export sorts by _id, not created_at: _id is always
+		// indexed, so the csv_*_id indexes turn filter+sort into a plain
+		// ordered walk the handler can stream. A blocking SORT here would
+		// mean the export buffers the whole match again.
+		{
+			"csv_status_only",
+			bson.M{"status": StatusDone},
+			bson.D{{Key: "_id", Value: 1}},
+		},
 		{
 			"csv_by_architecture",
 			bson.M{"status": StatusDone, "architecture": "LSTM"},
-			bson.D{{Key: "created_at", Value: 1}},
+			bson.D{{Key: "_id", Value: 1}},
 		},
 		{
 			"csv_by_loss_type",
 			bson.M{"status": StatusDone, "config.loss.type": "BCE"},
-			bson.D{{Key: "created_at", Value: 1}},
+			bson.D{{Key: "_id", Value: 1}},
+		},
+		{
+			"csv_by_agent_device",
+			bson.M{"status": StatusDone, "agent_id": "ag", "device": "cuda:0"},
+			bson.D{{Key: "_id", Value: 1}},
 		},
 	}
 
@@ -246,11 +260,11 @@ func TestEnsureIndexesCreatesTheFullSet(t *testing.T) {
 		}
 	}
 	want := []string{
-		"claim_speed_asc", "claim_speed_desc", "claim_size_asc", "claim_size_desc",
-		"claim_device_speed_asc", "claim_device_speed_desc",
+		"claim_speed_asc_v2", "claim_speed_desc_v2", "claim_size_asc", "claim_size_desc",
+		"claim_device_speed_asc_v2", "claim_device_speed_desc_v2",
 		"claim_device_size_asc", "claim_device_size_desc",
 		"list_status_created", "summary_running", "summary_duration",
-		"csv_architecture", "csv_agent_device", "csv_loss_type",
+		"csv_status_id", "csv_loss_type_id", "csv_architecture_id", "csv_agent_device_id",
 		"top_macro_f1", "top_subset_acc",
 	}
 	for _, w := range want {

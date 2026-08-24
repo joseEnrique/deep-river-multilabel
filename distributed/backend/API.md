@@ -114,6 +114,13 @@ Query params (all optional):
 
 Returns `text/csv` with `Content-Disposition: attachment; filename="results_<dataset>_<status>.csv"`.
 
+The export **streams**: rows are written as the cursor yields them (sorted by
+`exp_name`), `checkpoints` are projected out server-side, and the response
+starts within seconds regardless of size. It is exempt from the global 60s
+request timeout and carries its own 30-minute deadline instead. At most **2**
+exports run concurrently; a third gets `429` with `Retry-After` rather than
+queueing behind them.
+
 ## `GET .../experiments`
 
 List experiments.

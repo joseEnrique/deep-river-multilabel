@@ -402,7 +402,12 @@ func TestClaimNextUsesIndexNotInMemorySort(t *testing.T) {
 		{Key: "explain", Value: bson.D{
 			{Key: "find", Value: collectionName},
 			{Key: "filter", Value: bson.M{"status": bson.M{"$in": []Status{StatusPending, StatusFailed}}}},
-			{Key: "sort", Value: bson.D{{Key: "config.epochs", Value: 1}}},
+			// The sort the agent actually sends for its default pick_order
+			// (speed_asc). Explaining a shorter sort would prove nothing:
+			// the index leads with arch_rank, so `config.epochs` alone is
+			// not a prefix of it and would show a SORT stage that
+			// production never hits.
+			{Key: "sort", Value: mustParseSort(t, agentSortSpecs["speed_asc"])},
 			{Key: "limit", Value: 1},
 		}},
 		{Key: "verbosity", Value: "queryPlanner"},
@@ -593,4 +598,15 @@ func TestClaimNextHandlerBadJSONAndDataset(t *testing.T) {
 	if code != http.StatusBadRequest && code != http.StatusNotFound {
 		t.Errorf("invalid dataset: code = %d, want 400/404", code)
 	}
+}
+
+// mustParseSort turns one of the agent's sort strings into the sort document,
+// so the index tests explain exactly what claim-next runs.
+func mustParseSort(t *testing.T, spec string) bson.D {
+	t.Helper()
+	d, err := parseSort(spec)
+	if err != nil {
+		t.Fatalf("parseSort(%q): %v", spec, err)
+	}
+	return d
 }

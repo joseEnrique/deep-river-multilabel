@@ -37,6 +37,16 @@ const (
 	// Hard ceiling per operation. A runaway query gets killed server-side
 	// rather than holding a connection (and Mongo's resources) forever.
 	opTimeout = 55 * time.Second
+	// Ceiling for the CSV export, which is a cursor walk over the whole
+	// collection and not a point query. It streams as it goes, so a long
+	// export is not a stuck one, and 55s would kill it mid-file. The
+	// context deadline wins over the client-level opTimeout: the driver
+	// only applies its own timeout when the context has none.
+	exportTimeout = 30 * time.Minute
+	// Documents pulled per getMore while streaming the export. Small
+	// enough that a batch is never a memory event, large enough that a
+	// 60k-row export is not 60k round trips.
+	exportBatchSize = 500
 )
 
 func NewMongoStore(ctx context.Context, uri, dbPrefix string) (*Store, error) {
@@ -196,19 +206,36 @@ func (s *Store) EnsureIndexes(ctx context.Context, dataset string) error {
 		}),
 
 		// ── CSV export filters ───────────────────────────────────────────
-		idx("csv_architecture", bson.D{
+		// Every one of these ends in _id because the export sorts by _id so
+		// it can stream. Covering only the filter is not enough: Mongo would
+		// match from the index and then add a blocking SORT stage over the
+		// whole result set — 60k documents through a 32 MB cap, which fails
+		// rather than slows down. With _id as the trailing key the export is
+		// an ordered index walk that returns rows immediately.
+		//
+		// These replace the earlier `csv_architecture` / `csv_agent_device` /
+		// `csv_loss_type`, which sorted on created_at or on nothing. Like the
+		// claim_* renames above, the old ones are still in Mongo and unused;
+		// drop them by hand with dropIndex.
+		idx("csv_status_id", bson.D{
+			{Key: "status", Value: 1},
+			{Key: "_id", Value: 1},
+		}),
+		idx("csv_loss_type_id", bson.D{
+			{Key: "status", Value: 1},
+			{Key: "config.loss.type", Value: 1},
+			{Key: "_id", Value: 1},
+		}),
+		idx("csv_architecture_id", bson.D{
 			{Key: "status", Value: 1},
 			{Key: "architecture", Value: 1},
-			{Key: "created_at", Value: 1},
+			{Key: "_id", Value: 1},
 		}),
-		idx("csv_agent_device", bson.D{
+		idx("csv_agent_device_id", bson.D{
 			{Key: "status", Value: 1},
 			{Key: "agent_id", Value: 1},
 			{Key: "device", Value: 1},
-		}),
-		idx("csv_loss_type", bson.D{
-			{Key: "status", Value: 1},
-			{Key: "config.loss.type", Value: 1},
+			{Key: "_id", Value: 1},
 		}),
 
 		// ── cube/top on the two metrics actually reported ────────────────
@@ -485,6 +512,49 @@ func (s *Store) ListFiltered(ctx context.Context, dataset string, filter bson.M,
 		return nil, err
 	}
 	return out, nil
+}
+
+// StreamFiltered is ListFiltered without the slice: it hands back the open
+// cursor so the caller can walk the result set one document at a time.
+//
+// ListFiltered decodes *every* match into memory before the caller sees the
+// first one. On `results.csv?loss_type=AdaptiveFocal` that is 60k+ documents
+// held at once, and the handler then built a second full copy of them as
+// strings — enough to get the process OOM-killed, which is exactly what used
+// to happen. Nothing about a CSV export needs the whole set in memory, so
+// this exists for it.
+//
+// Two other differences matter:
+//
+//   - It sorts by `_id` instead of `created_at`. There is no index on
+//     {status, config.loss.type, created_at}, so that sort was a blocking
+//     in-memory SORT stage over the entire match — capped at 32 MB by Mongo,
+//     i.e. it does not degrade, it fails. `_id` is always indexed and the
+//     csv_*_id indexes make filter+sort a plain ordered index walk.
+//   - `projection` lets the caller drop `checkpoints`, which the CSV never
+//     reads and which is by far the largest field on a finished run.
+func (s *Store) StreamFiltered(ctx context.Context, dataset string, filter bson.M, projection bson.M, limit, offset int64) (*mongo.Cursor, error) {
+	c, err := s.coll(dataset)
+	if err != nil {
+		return nil, err
+	}
+	if filter == nil {
+		filter = bson.M{}
+	}
+	opts := options.Find().
+		SetSort(bson.D{{Key: "_id", Value: 1}}).
+		SetBatchSize(exportBatchSize).
+		SetNoCursorTimeout(true)
+	if projection != nil {
+		opts = opts.SetProjection(projection)
+	}
+	if limit > 0 {
+		opts = opts.SetLimit(limit)
+	}
+	if offset > 0 {
+		opts = opts.SetSkip(offset)
+	}
+	return c.Find(ctx, filter, opts)
 }
 
 func (s *Store) Replace(ctx context.Context, dataset string, exp *Experiment) error {

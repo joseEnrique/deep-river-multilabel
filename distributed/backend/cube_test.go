@@ -355,6 +355,121 @@ func TestResultsCSVStatusAllIncludesPending(t *testing.T) {
 	}
 }
 
+// The header is now discovered in a separate key-only pass instead of by
+// buffering every document, so the risk the rewrite introduces is a header
+// that misses a column some later row has — which would silently shift every
+// value in that row. Seed documents with deliberately different key sets.
+func TestResultsCSVHeaderCoversEveryRow(t *testing.T) {
+	s, ds := testStore(t)
+	plain := doneExp("a_plain", 1, 32, "LSTM", 10)
+	rich := doneExp("b_rich", 3, 64, "CNN", 30)
+	rich.Config["loss"] = map[string]interface{}{
+		"type": "AdaptiveFocal", "base_alpha": 0.25, "decay": 0.99,
+	}
+	rich.Config["machine"] = 18
+	rich.FinalMetrics["mean_gamma"] = 1.5
+	seed(t, s, ds, plain, rich)
+
+	req := httptest.NewRequest("GET", "/api/v1/datasets/"+ds+"/results.csv", nil)
+	rec := httptest.NewRecorder()
+	cubeRouter(s).ServeHTTP(rec, req)
+
+	rows, err := csv.NewReader(strings.NewReader(rec.Body.String())).ReadAll()
+	if err != nil {
+		t.Fatalf("not valid CSV: %v", err)
+	}
+	if len(rows) != 3 {
+		t.Fatalf("rows = %d, want 3 (header + 2)", len(rows))
+	}
+	col := map[string]int{}
+	for i, name := range rows[0] {
+		col[name] = i
+	}
+	for _, want := range []string{
+		"cfg.loss.type", "cfg.loss.base_alpha", "cfg.loss.decay",
+		"cfg.machine", "metric.mean_gamma",
+	} {
+		if _, ok := col[want]; !ok {
+			t.Fatalf("header missing %q: %v", want, rows[0])
+		}
+	}
+	// Rows come back sorted by _id, so a_plain is first.
+	if got := rows[1][col["exp_name"]]; got != "a_plain" {
+		t.Errorf("first row = %q, want a_plain (export sorts by _id)", got)
+	}
+	// The document without those keys must carry empty cells, not a shift.
+	for _, absent := range []string{"cfg.loss.base_alpha", "cfg.machine", "metric.mean_gamma"} {
+		if got := rows[1][col[absent]]; got != "" {
+			t.Errorf("a_plain[%s] = %q, want empty", absent, got)
+		}
+	}
+	if got := rows[2][col["cfg.loss.type"]]; got != "AdaptiveFocal" {
+		t.Errorf("b_rich[cfg.loss.type] = %q", got)
+	}
+	if got := rows[2][col["cfg.machine"]]; got != "18" {
+		t.Errorf("b_rich[cfg.machine] = %q", got)
+	}
+}
+
+// checkpoints are projected out of the export: they are the biggest field on a
+// finished run and the CSV never reads them. Decoding them anyway is a large
+// part of what made the old export a memory event.
+func TestResultsCSVIgnoresCheckpoints(t *testing.T) {
+	s, ds := testStore(t)
+	e := doneExp("with_cp", 1, 32, "LSTM", 10)
+	for i := 0; i < 50; i++ {
+		e.Checkpoints = append(e.Checkpoints, Checkpoint{
+			Step: i * 1000, ElapsedS: float64(i), Metrics: map[string]float64{"loss": 0.5},
+		})
+	}
+	seed(t, s, ds, e)
+
+	req := httptest.NewRequest("GET", "/api/v1/datasets/"+ds+"/results.csv", nil)
+	rec := httptest.NewRecorder()
+	cubeRouter(s).ServeHTTP(rec, req)
+
+	rows, err := csv.NewReader(strings.NewReader(rec.Body.String())).ReadAll()
+	if err != nil {
+		t.Fatalf("not valid CSV: %v", err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("rows = %d, want 2", len(rows))
+	}
+	for _, name := range rows[0] {
+		if strings.Contains(name, "checkpoint") {
+			t.Errorf("header leaks checkpoints: %q", name)
+		}
+	}
+}
+
+// Exports are capped: each one walks the whole collection, and an unbounded
+// number of them in flight is how the server stops answering agents.
+func TestResultsCSVRejectsConcurrentExports(t *testing.T) {
+	s, ds := testStore(t)
+	seed(t, s, ds, doneExp("a", 1, 32, "LSTM", 10))
+
+	// Occupy every slot, as in-flight exports would.
+	for i := 0; i < cap(csvExportSlots); i++ {
+		csvExportSlots <- struct{}{}
+	}
+	defer func() {
+		for i := 0; i < cap(csvExportSlots); i++ {
+			<-csvExportSlots
+		}
+	}()
+
+	req := httptest.NewRequest("GET", "/api/v1/datasets/"+ds+"/results.csv", nil)
+	rec := httptest.NewRecorder()
+	cubeRouter(s).ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusTooManyRequests {
+		t.Errorf("code = %d, want 429", rec.Code)
+	}
+	if rec.Header().Get("Retry-After") == "" {
+		t.Error("no Retry-After on the 429 — the client has nothing to back off on")
+	}
+}
+
 func TestCubeInvalidDataset(t *testing.T) {
 	s, _ := testStore(t)
 	srv := cubeRouter(s)
